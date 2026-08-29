@@ -4,6 +4,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:math';
 import '../../../core/constants/app_colors.dart';
+import '../../../core/constants/panabo_barangays.dart';
 import '../../../core/utils/responsive_utils.dart';
 import '../../../shared/widgets/custom_button.dart';
 import '../../../shared/widgets/custom_text_field.dart';
@@ -85,49 +86,7 @@ class _SignupScreenState extends State<SignupScreen> {
       : null;
 
   // ── Official 41 Barangays of Panabo City ─────────────────────────────────
-  final List<String> _barangays = [
-    'A. O. Floirendo',
-    'Buenavista',
-    'Cacao',
-    'Cagangohan',
-    'Consolacion',
-    'Dalisay',
-    'Dapco',
-    'Datu Abdul Dadia',
-    'Gredu (Poblacion)',
-    'J.P. Laurel',
-    'Kasilak',
-    'Katipunan',
-    'Katualan',
-    'Kauswagan',
-    'Kiotoy',
-    'Little Panay',
-    'Lower Panaga (Roxas)',
-    'Mabunao',
-    'Maduao',
-    'Malativas',
-    'Manay',
-    'Nanyo',
-    'New Malaga',
-    'New Malitbog',
-    'New Pandan (Poblacion)',
-    'New Visayas',
-    'Quezon',
-    'Salvacion',
-    'San Francisco (Poblacion)',
-    'San Nicolas',
-    'San Pedro',
-    'San Roque',
-    'San Vicente',
-    'Santa Cruz',
-    'Santo Niño (Poblacion)',
-    'Sindaton',
-    'Southern Davao',
-    'Tagpore',
-    'Tibungol',
-    'Upper Licanan',
-    'Waterfall',
-  ];
+  final List<String> _barangays = kPanaboBarangays;
 
   // ── GPS centroids [lat, lng] ──────────────────────────────────────────────
   static const Map<String, List<double>> _barangayCentroids = {

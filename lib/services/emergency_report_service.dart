@@ -119,6 +119,15 @@ class EmergencyReportService {
     required String userName,
     required Map<String, dynamic> emergencyData,
     String familyCode = '',
+    // Set when the reporter picked "this happened somewhere else" and chose
+    // a barangay manually — e.g. they're reporting a fire they passed on
+    // the way home, after already leaving. When present, this barangay is
+    // used for the report's location/routing instead of the reporter's own
+    // GPS fix, which would otherwise wrongly pin the incident to wherever
+    // they are right now. The reporter's actual GPS is still captured into
+    // `Location` either way, so dispatchers can still see where to reach
+    // the reporter themselves if they need to follow up.
+    String? manualBarangay,
   }) async {
     try {
       final type = emergencyData['type']?.toString() ?? 'other';
@@ -158,7 +167,15 @@ class EmergencyReportService {
       // Resolved from THIS report's actual GPS fix (gpsPos above), not the
       // static home barangay saved on the user's account — a report made
       // while out and about must reflect where the user actually is.
-      final barangay = await resolveReportBarangay(gpsPos, userId);
+      // Unless the reporter explicitly said this happened somewhere else
+      // (manualBarangay), in which case that overrides the GPS guess —
+      // `location` above still reflects their real GPS regardless, so it's
+      // never lost, just no longer used to tag WHERE the incident is.
+      final hasManualBarangay =
+          manualBarangay != null && manualBarangay.trim().isNotEmpty;
+      final barangay = hasManualBarangay
+          ? manualBarangay.trim()
+          : await resolveReportBarangay(gpsPos, userId);
       final now = DateTime.now();
       final createdAt = _formatDate(now);
       final reportId = _generateReportId(type);
@@ -174,6 +191,7 @@ class EmergencyReportService {
         'Timestamp': now.toIso8601String(),
         'Location': location,
         'Barangay': barangay.isNotEmpty ? barangay : 'Unknown Barangay',
+        'LocationSource': hasManualBarangay ? 'manual' : 'reporter_gps',
         'Details': _buildDetails(emergencyData),
         if (isFamilySos) 'Priority': 'critical',
         if (isFamilySos) 'AlertLevel': 'family-sos',

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../../core/constants/app_colors.dart';
+import '../../../core/constants/panabo_barangays.dart';
 import '../../../services/emergency_report_service.dart';
 import 'my_reports_screen.dart';
 
@@ -47,6 +48,12 @@ class _EmergencyConfirmationScreenState
   String _savedReportId = '';
   String _savedReportLabel = '';
 
+  // ── "This happened somewhere else" override ─────────────────────────────
+  // Default false: the overwhelming majority of reports are made from the
+  // scene, so the common case stays exactly as it was — no extra step.
+  bool _reportingElsewhere = false;
+  String? _selectedBarangay;
+
   late AnimationController _pulseController;
 
   @override
@@ -82,6 +89,7 @@ class _EmergencyConfirmationScreenState
       userName: widget.userName,
       emergencyData: widget.emergencyData,
       familyCode: familyCode,
+      manualBarangay: _reportingElsewhere ? _selectedBarangay : null,
     );
 
     if (!mounted) return;
@@ -209,26 +217,141 @@ class _EmergencyConfirmationScreenState
         color: AppColors.lightGrey,
         borderRadius: BorderRadius.circular(12),
       ),
-      child: const Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(Icons.location_on, color: AppColors.primary, size: 24),
-          SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('Your Current Location',
-                    style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.bold,
-                        color: AppColors.secondary)),
-                SizedBox(height: 4),
-                Text('Your location will be attached as a place name',
-                    style: TextStyle(fontSize: 12, color: AppColors.textLight)),
-              ],
-            ),
+          Row(
+            children: [
+              const Icon(Icons.location_on, color: AppColors.primary, size: 24),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Where did this happen?',
+                        style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.bold,
+                            color: AppColors.secondary)),
+                    const SizedBox(height: 4),
+                    Text(
+                      _reportingElsewhere
+                          ? 'Pick the barangay below — not attached to your current location'
+                          : 'Your current location will be attached as a place name',
+                      style: const TextStyle(
+                          fontSize: 12, color: AppColors.textLight),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              Expanded(
+                child: _buildLocationChoiceChip(
+                  label: 'Here, right now',
+                  icon: Icons.my_location,
+                  selected: !_reportingElsewhere,
+                  onTap: () => setState(() => _reportingElsewhere = false),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: _buildLocationChoiceChip(
+                  label: 'Somewhere else',
+                  icon: Icons.map_outlined,
+                  selected: _reportingElsewhere,
+                  onTap: () => setState(() => _reportingElsewhere = true),
+                ),
+              ),
+            ],
+          ),
+          if (_reportingElsewhere) ...[
+            const SizedBox(height: 14),
+            _buildBarangayPicker(),
+          ],
         ],
+      ),
+    );
+  }
+
+  Widget _buildLocationChoiceChip({
+    required String label,
+    required IconData icon,
+    required bool selected,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 10),
+        decoration: BoxDecoration(
+          color: selected ? AppColors.primary : Colors.white,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+            color:
+                selected ? AppColors.primary : AppColors.grey.withValues(alpha: 0.4),
+            width: selected ? 2 : 1,
+          ),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon,
+                size: 20, color: selected ? Colors.white : AppColors.primary),
+            const SizedBox(height: 4),
+            Text(
+              label,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 12.5,
+                fontWeight: selected ? FontWeight.bold : FontWeight.w500,
+                color: selected ? Colors.white : AppColors.secondary,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBarangayPicker() {
+    final missingSelection = _selectedBarangay == null;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: missingSelection
+              ? AppColors.danger.withValues(alpha: 0.4)
+              : AppColors.grey.withValues(alpha: 0.3),
+        ),
+      ),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<String>(
+          isExpanded: true,
+          value: _selectedBarangay,
+          hint: const Text(
+            'Select the barangay where it happened',
+            style: TextStyle(fontSize: 13, color: AppColors.textLight),
+          ),
+          icon: const Icon(Icons.keyboard_arrow_down, color: AppColors.primary),
+          items: kPanaboBarangays
+              .map(
+                (b) => DropdownMenuItem(
+                  value: b,
+                  child: Text(b,
+                      style: const TextStyle(
+                          fontSize: 13.5, color: AppColors.secondary)),
+                ),
+              )
+              .toList(),
+          onChanged: (value) => setState(() => _selectedBarangay = value),
+        ),
       ),
     );
   }
@@ -450,11 +573,14 @@ class _EmergencyConfirmationScreenState
   }
 
   Widget _buildConfirmButton() {
+    final missingManualBarangay =
+        _reportingElsewhere && _selectedBarangay == null;
+    final canSend = !_isSending && !missingManualBarangay;
     return SizedBox(
       width: double.infinity,
       height: 56,
       child: ElevatedButton(
-        onPressed: _isSending ? null : _sendEmergencyAlert,
+        onPressed: canSend ? _sendEmergencyAlert : null,
         style: ElevatedButton.styleFrom(
           backgroundColor: widget.emergencyColor,
           disabledBackgroundColor: widget.emergencyColor.withOpacity(0.5),
