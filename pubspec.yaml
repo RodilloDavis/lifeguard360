@@ -1,0 +1,72 @@
+name: lifeguard360
+description: A new Flutter project for emergency response and safety tracking.
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.2
+  
+  # Firebase
+  firebase_core: ^4.4.0
+  firebase_database: ^12.1.3
+  cloud_firestore: ^6.1.2
+  firebase_messaging: ^16.1.2
+
+  # Networking
+  http: ^1.2.0
+
+  # Image picking
+  image_picker: ^1.1.2
+  
+  # Maps & Location
+  flutter_map: ^8.2.2
+  latlong2: ^0.9.1
+  geolocator: ^14.0.2
+  google_maps_flutter: ^2.7.0
+  google_maps_flutter_android: ^2.14.0
+  geocoding: ^3.0.0
+  
+  # Utilities
+  intl: ^0.20.0
+  url_launcher: ^6.2.6
+  share_plus: ^10.1.4
+  path_provider: ^2.1.5
+  shared_preferences: ^2.2.2
+  permission_handler: ^12.0.1
+  qr_flutter: ^4.1.0
+  mobile_scanner: ^7.2.0
+  sensors_plus: ^7.0.0
+  
+  # Background Service & Notifications
+  flutter_background_service: ^5.0.5
+  flutter_local_notifications: ^20.1.0
+  audioplayers: ^6.1.0
+  
+  # FCM JWT signing (required by fcm_service.dart)
+  dart_jsonwebtoken: ^3.3.2
+
+  flutter_overlay_window: ^0.4.5
+  firebase_auth: ^6.5.7
+  google_sign_in: 6.2.1
+  firebase_crashlytics: ^5.2.7
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+# Vendored locally to patch OverlayService's drag handling — see
+# packages/flutter_overlay_window/android/.../OverlayService.java for the
+# bottom-of-screen clamp that keeps the SOS bubble off the nav bar.
+dependency_overrides:
+  flutter_overlay_window:
+    path: packages/flutter_overlay_window
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/sounds/shake_siren.mp3

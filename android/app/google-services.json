@@ -1,0 +1,77 @@
+{
+  "project_info": {
+    "project_number": "579792179500",
+    "firebase_url": "https://lifeguard-cefd9-default-rtdb.asia-southeast1.firebasedatabase.app",
+    "project_id": "lifeguard-cefd9",
+    "storage_bucket": "lifeguard-cefd9.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:579792179500:android:ab1fc0f69e11a9f4705c89",
+        "android_client_info": {
+          "package_name": "com.android.application"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "579792179500-g1t2jp3keu4voa3r3duo33q54akhof48.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCoBr-q1LF2dJhOAEhfP5GhpZKnhza-TgA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "579792179500-g1t2jp3keu4voa3r3duo33q54akhof48.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:579792179500:android:79a13340deae1512705c89",
+        "android_client_info": {
+          "package_name": "com.example.lifeguard360"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "579792179500-t8ilenv9n7rdrusf959sr3ni46pnijcc.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.example.lifeguard360",
+            "certificate_hash": "99f124fff3b3836c7062a35b5874c67cd228d9c7"
+          }
+        },
+        {
+          "client_id": "579792179500-g1t2jp3keu4voa3r3duo33q54akhof48.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCoBr-q1LF2dJhOAEhfP5GhpZKnhza-TgA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "579792179500-g1t2jp3keu4voa3r3duo33q54akhof48.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
