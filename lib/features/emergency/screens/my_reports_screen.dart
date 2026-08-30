@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../../../core/constants/app_colors.dart';
 import '../../../core/widgets/animated_refresh_button.dart';
 import '../../../services/emergency_report_service.dart';
+import '../../../services/offline_report_queue_service.dart';
 
 // Values arrive from the DB as raw slugs ("fire-report", "family-bubble-sos")
 // — turn them into readable text before they reach the UI.
@@ -114,6 +115,44 @@ String _reportsFingerprint(List<Map<String, dynamic>> reports) {
       ..write(';');
   }
   return buffer.toString();
+}
+
+// Shown while one or more reports made offline are still sitting on this
+// device waiting for a connection — separate from _offlineBanner, which is
+// about a stale READ, not a report that hasn't actually reached the server
+// yet. Distinguished with an orange/pending look rather than the neutral
+// grey used for "showing cached data", since this is closer to "action
+// still pending" than "data might be old".
+Widget _queuedReportsBanner(int count) {
+  final label = count == 1
+      ? '1 report saved on this device — will send automatically once online'
+      : '$count reports saved on this device — will send automatically once online';
+  return Container(
+    width: double.infinity,
+    margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+    decoration: BoxDecoration(
+      color: Colors.orange.withOpacity(0.1),
+      borderRadius: BorderRadius.circular(10),
+      border: Border.all(color: Colors.orange.withOpacity(0.35)),
+    ),
+    child: Row(
+      children: [
+        const Icon(Icons.schedule_send, size: 16, color: Colors.orange),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            label,
+            style: const TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+              color: Colors.orange,
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
 }
 
 // Shown in place of an error screen when a fetch fails but we already have
@@ -260,6 +299,13 @@ class _MyReportsScreenState extends State<MyReportsScreen>
   // point is that already-loaded reports stay visible while this is true.
   bool _isOffline = false;
 
+  // Number of reports made on this device that are still queued locally
+  // (see OfflineReportQueueService) waiting for connectivity to actually
+  // reach the server — separate from _isOffline, which is about a stale
+  // read of reports that already made it through.
+  int _queuedCount = 0;
+  StreamSubscription<int>? _queuedCountSub;
+
   // A report's status can move Pending → In Progress → Resolved on the
   // dispatcher's side at any moment while this screen just sits open — a
   // one-shot load only ever reflects whatever was true when the screen
@@ -285,12 +331,16 @@ class _MyReportsScreenState extends State<MyReportsScreen>
     _initReports();
     _autoRefreshTimer = Timer.periodic(
         const Duration(seconds: 12), (_) => _refreshAll(silent: true));
+    _queuedCountSub = OfflineReportQueueService.pendingCountStream.listen((count) {
+      if (mounted) setState(() => _queuedCount = count);
+    });
   }
 
   @override
   void dispose() {
     _tabController.dispose();
     _autoRefreshTimer?.cancel();
+    _queuedCountSub?.cancel();
     super.dispose();
   }
 
@@ -541,6 +591,7 @@ class _MyReportsScreenState extends State<MyReportsScreen>
       ),
       body: Column(
         children: [
+          if (_queuedCount > 0) _queuedReportsBanner(_queuedCount),
           if (_isOffline) _offlineBanner(),
           Expanded(
             child: TabBarView(

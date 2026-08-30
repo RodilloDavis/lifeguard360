@@ -603,6 +603,7 @@ import 'core/constants/app_colors.dart';
 import 'firebase_options.dart';
 import 'services/background_service.dart';
 import 'services/fcm_service.dart';
+import 'services/offline_report_queue_service.dart';
 import 'features/auth/screens/login_screen.dart';
 import 'features/dashboard/screens/dashboard_screen.dart';
 import 'features/notifications/screens/shake_sos_alert_screen.dart';
@@ -921,6 +922,13 @@ void main() async {
       // foreground. Fired before anything else in this block so it clears
       // as fast as possible.
       await OverlayService.hide();
+
+      // Starts the connectivity listener and makes a best-effort attempt
+      // to send anything left over in the offline report queue from a
+      // previous session (e.g. the app was killed before it ever
+      // reconnected). Deferred here like everything else in this block —
+      // it doesn't gate the first frame.
+      OfflineReportQueueService.init();
 
       await AppBackgroundService.initialize();
       await AppBackgroundService.start();

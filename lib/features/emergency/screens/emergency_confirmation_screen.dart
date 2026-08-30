@@ -44,6 +44,7 @@ class _EmergencyConfirmationScreenState
   bool _isSending = false;
   bool _isSuccess = false;
   bool _hasFailed = false;
+  bool _isQueued = false;
   String _errorMessage = '';
   String _savedReportId = '';
   String _savedReportLabel = '';
@@ -98,6 +99,7 @@ class _EmergencyConfirmationScreenState
       setState(() {
         _isSending = false;
         _isSuccess = true;
+        _isQueued = result['queued'] == true;
         _savedReportId = result['reportId']?.toString() ?? '';
         _savedReportLabel = result['reportLabel']?.toString() ?? '';
       });
@@ -741,7 +743,7 @@ class _EmergencyConfirmationScreenState
 
   Widget _buildSuccessScreen() {
     return Scaffold(
-      backgroundColor: AppColors.success,
+      backgroundColor: _isQueued ? AppColors.primary : AppColors.success,
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(24.0),
@@ -754,20 +756,25 @@ class _EmergencyConfirmationScreenState
                   color: Colors.white.withOpacity(0.2),
                   shape: BoxShape.circle,
                 ),
-                child: const Icon(Icons.check_circle_outline,
+                child: Icon(
+                    _isQueued ? Icons.cloud_off_outlined : Icons.check_circle_outline,
                     size: 100, color: Colors.white),
               ),
               const SizedBox(height: 32),
-              const Text('Alert Sent Successfully!',
-                  style: TextStyle(
+              Text(
+                  _isQueued ? 'Report Saved — No Connection' : 'Alert Sent Successfully!',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
                       color: Colors.white,
                       fontSize: 28,
                       fontWeight: FontWeight.bold)),
               const SizedBox(height: 16),
-              const Text(
-                'Emergency services have been notified\nHelp is on the way',
+              Text(
+                _isQueued
+                    ? 'Your report is saved on this device and will be sent automatically the moment you\'re back online'
+                    : 'Emergency services have been notified\nHelp is on the way',
                 textAlign: TextAlign.center,
-                style: TextStyle(color: Colors.white, fontSize: 16),
+                style: const TextStyle(color: Colors.white, fontSize: 16),
               ),
 
               // ── Report ID + label chip ─────────────────────────────────
@@ -825,7 +832,7 @@ class _EmergencyConfirmationScreenState
               ],
 
               const Spacer(),
-              _build911SuccessBox(),
+              _isQueued ? _buildQueuedBox() : _build911SuccessBox(),
               const SizedBox(height: 16),
 
               // ── View My Reports button ─────────────────────────────────
@@ -888,6 +895,53 @@ class _EmergencyConfirmationScreenState
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _buildQueuedBox() {
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.2),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.white.withOpacity(0.3), width: 2),
+      ),
+      child: Column(
+        children: [
+          const Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.schedule_send, color: Colors.white, size: 24),
+              SizedBox(width: 8),
+              Text('Waiting to Send',
+                  style: TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white)),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Container(
+            padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: const Text('No signal detected right now',
+                style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: AppColors.primary)),
+          ),
+          const SizedBox(height: 12),
+          const Text(
+              'If this is life-threatening and you have no signal, '
+              'call 911 directly or move to where you can get a connection.',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                  fontSize: 12, color: Colors.white, height: 1.4)),
+        ],
       ),
     );
   }

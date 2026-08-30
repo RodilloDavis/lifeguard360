@@ -11,13 +11,16 @@
 // NEW: Standard reports now also push FCM to all registered dispatchers.
 //   ✅ Sends FCM push to /DispatcherTokens after every non-shake report save.
 
+import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 import 'package:http/http.dart' as http;
 import 'package:geolocator/geolocator.dart';
 import 'package:geocoding/geocoding.dart' as geocoding;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'fcm_service.dart';
+import 'offline_report_queue_service.dart';
 import '../core/utils/cached_http_get.dart';
 
 class EmergencyReportService {
@@ -114,6 +117,18 @@ class EmergencyReportService {
   }
 
   // ── Core save method ──────────────────────────────────────────────────────
+  //
+  // OFFLINE QUEUEING: everything up to and including `reportPayload` below
+  // is resolved locally (GPS is device-only; barangay resolution prefers
+  // the offline centroid match — see resolveReportBarangay — before ever
+  // touching the network) so a report can be fully built even with zero
+  // connectivity. Only the actual network writes need connectivity, so
+  // that's the only part that gets queued for later — via
+  // OfflineReportQueueService — while ReportId/timestamp/location stay
+  // exactly what they were at the moment the user hit send, not whenever
+  // the device happens to reconnect. See _persistBuiltReport and
+  // persistQueuedReport, which the queue's flush calls to replay this same
+  // context without recomputing any of it.
   static Future<Map<String, dynamic>> saveReport({
     required String userId,
     required String userName,
@@ -128,75 +143,208 @@ class EmergencyReportService {
     // `Location` either way, so dispatchers can still see where to reach
     // the reporter themselves if they need to follow up.
     String? manualBarangay,
+    // Set by OfflineReportQueueService.flushQueue()'s own retry path (via
+    // persistQueuedReport) — never by a normal caller. Skips the
+    // connectivity precheck/auto-queue-on-failure so a report already
+    // waiting in the queue can't get queued a second time behind itself.
+    bool bypassQueue = false,
   }) async {
+    final type = emergencyData['type']?.toString() ?? 'other';
+    final reportLabel = getReportLabel(type);
+    final isFamilySos = type == 'shake' || type == 'bubble';
+
+    print(
+        '🔵 Saving report → type: $type | label: $reportLabel | userId: $userId');
+
+    // ── GPS ─────────────────────────────────────────────────────────────
+    Map<String, dynamic> location = {
+      'Latitude': null,
+      'Longitude': null,
+      'Address': 'Location unavailable',
+      'LastUpdated': _formatDate(DateTime.now()),
+    };
+    Map<String, double>? gpsPos;
+
     try {
-      final type = emergencyData['type']?.toString() ?? 'other';
-      final reportLabel = getReportLabel(type);
-      final isFamilySos = type == 'shake' || type == 'bubble';
-
-      print(
-          '🔵 Saving report → type: $type | label: $reportLabel | userId: $userId');
-
-      // ── GPS ─────────────────────────────────────────────────────────────
-      Map<String, dynamic> location = {
-        'Latitude': null,
-        'Longitude': null,
-        'Address': 'Location unavailable',
+      gpsPos = await _getCurrentLocation();
+    } catch (e) {
+      print('⚠️ Could not get GPS for report: $e');
+    }
+    if (gpsPos != null) {
+      // Reverse geocoding is tried separately from the GPS fix itself: the
+      // fix comes straight from the device (works offline), while turning
+      // it into an address can call out to the network and fail on its
+      // own. A failure here used to discard the GPS fix entirely (both
+      // lived in the same try block) — now the coordinates are kept
+      // either way and only the address falls back to a placeholder.
+      String address = 'Location unavailable';
+      try {
+        address = await reverseGeocode(gpsPos['latitude']!, gpsPos['longitude']!);
+      } catch (e) {
+        print('⚠️ Could not reverse geocode report location: $e');
+      }
+      location = {
+        'Latitude': gpsPos['latitude'],
+        'Longitude': gpsPos['longitude'],
+        'Address': address,
         'LastUpdated': _formatDate(DateTime.now()),
       };
-      Map<String, double>? gpsPos;
+    }
 
-      try {
-        gpsPos = await _getCurrentLocation();
-        if (gpsPos != null) {
-          final address = await reverseGeocode(
-            gpsPos['latitude']!,
-            gpsPos['longitude']!,
-          );
-          location = {
-            'Latitude': gpsPos['latitude'],
-            'Longitude': gpsPos['longitude'],
-            'Address': address,
-            'LastUpdated': _formatDate(DateTime.now()),
-          };
-        }
-      } catch (e) {
-        print('⚠️ Could not get GPS for report: $e');
-      }
+    // Resolved from THIS report's actual GPS fix (gpsPos above), not the
+    // static home barangay saved on the user's account — a report made
+    // while out and about must reflect where the user actually is.
+    // Unless the reporter explicitly said this happened somewhere else
+    // (manualBarangay), in which case that overrides the GPS guess —
+    // `location` above still reflects their real GPS regardless, so it's
+    // never lost, just no longer used to tag WHERE the incident is.
+    final hasManualBarangay =
+        manualBarangay != null && manualBarangay.trim().isNotEmpty;
+    final barangay = hasManualBarangay
+        ? manualBarangay.trim()
+        : await resolveReportBarangay(gpsPos, userId);
+    final now = DateTime.now();
+    final createdAt = _formatDate(now);
+    final reportId = _generateReportId(type);
 
-      // Resolved from THIS report's actual GPS fix (gpsPos above), not the
-      // static home barangay saved on the user's account — a report made
-      // while out and about must reflect where the user actually is.
-      // Unless the reporter explicitly said this happened somewhere else
-      // (manualBarangay), in which case that overrides the GPS guess —
-      // `location` above still reflects their real GPS regardless, so it's
-      // never lost, just no longer used to tag WHERE the incident is.
-      final hasManualBarangay =
-          manualBarangay != null && manualBarangay.trim().isNotEmpty;
-      final barangay = hasManualBarangay
-          ? manualBarangay.trim()
-          : await resolveReportBarangay(gpsPos, userId);
-      final now = DateTime.now();
-      final createdAt = _formatDate(now);
-      final reportId = _generateReportId(type);
+    final reportPayload = <String, dynamic>{
+      'ReportId': reportId,
+      'ReportLabel': reportLabel,
+      'UserId': userId,
+      'UserName': userName,
+      'EmergencyType': type,
+      'Status': isFamilySos ? 'Active' : 'Pending',
+      'CreatedAt': createdAt,
+      'Timestamp': now.toIso8601String(),
+      'Location': location,
+      'Barangay': barangay.isNotEmpty ? barangay : 'Unknown Barangay',
+      'LocationSource': hasManualBarangay ? 'manual' : 'reporter_gps',
+      'Details': _buildDetails(emergencyData),
+      if (isFamilySos) 'Priority': 'critical',
+      if (isFamilySos) 'AlertLevel': 'family-sos',
+    };
 
-      final reportPayload = <String, dynamic>{
-        'ReportId': reportId,
-        'ReportLabel': reportLabel,
-        'UserId': userId,
-        'UserName': userName,
-        'EmergencyType': type,
-        'Status': isFamilySos ? 'Active' : 'Pending',
-        'CreatedAt': createdAt,
-        'Timestamp': now.toIso8601String(),
-        'Location': location,
-        'Barangay': barangay.isNotEmpty ? barangay : 'Unknown Barangay',
-        'LocationSource': hasManualBarangay ? 'manual' : 'reporter_gps',
-        'Details': _buildDetails(emergencyData),
-        if (isFamilySos) 'Priority': 'critical',
-        if (isFamilySos) 'AlertLevel': 'family-sos',
+    Future<Map<String, dynamic>> queueForLater() async {
+      await OfflineReportQueueService.enqueue(
+        type: type,
+        reportId: reportId,
+        reportLabel: reportLabel,
+        isFamilySos: isFamilySos,
+        userId: userId,
+        userName: userName,
+        familyCode: familyCode,
+        reportPayload: reportPayload,
+        location: location,
+        barangay: barangay,
+        gpsPos: gpsPos,
+        now: now,
+        createdAt: createdAt,
+        emergencyData: emergencyData,
+      );
+      print('📥 No connectivity — queued report $reportId to send automatically once back online');
+      return {
+        'success': true,
+        'queued': true,
+        'reportId': reportId,
+        'reportLabel': reportLabel,
       };
+    }
 
+    if (!bypassQueue && !await OfflineReportQueueService.hasConnectivity()) {
+      return queueForLater();
+    }
+
+    try {
+      return await _persistBuiltReport(
+        type: type,
+        reportId: reportId,
+        reportLabel: reportLabel,
+        isFamilySos: isFamilySos,
+        userId: userId,
+        userName: userName,
+        familyCode: familyCode,
+        reportPayload: reportPayload,
+        location: location,
+        barangay: barangay,
+        gpsPos: gpsPos,
+        now: now,
+        createdAt: createdAt,
+        emergencyData: emergencyData,
+      );
+    } catch (e) {
+      print('❌ saveReport error: $e');
+      if (!bypassQueue && _isConnectivityError(e)) {
+        return queueForLater();
+      }
+      return {'success': false, 'error': 'Error: $e'};
+    }
+  }
+
+  /// True for exceptions that mean "the network wasn't reachable" rather
+  /// than a real application/server error — the distinction that decides
+  /// whether saveReport() queues the report for later or reports it as a
+  /// hard failure the user has to explicitly retry.
+  static bool _isConnectivityError(Object e) {
+    return e is SocketException ||
+        e is TimeoutException ||
+        e is http.ClientException;
+  }
+
+  /// Replays a report exactly as it was captured by [saveReport] before it
+  /// got queued — same ReportId, same timestamp, same GPS/address/barangay
+  /// — instead of resolving any of that fresh at send time. Called by
+  /// [OfflineReportQueueService.flushQueue] once connectivity is back.
+  /// [ctx] is one entry as stored by OfflineReportQueueService.enqueue.
+  static Future<Map<String, dynamic>> persistQueuedReport(
+      Map<String, dynamic> ctx) async {
+    try {
+      return await _persistBuiltReport(
+        type: ctx['type'] as String,
+        reportId: ctx['reportId'] as String,
+        reportLabel: ctx['reportLabel'] as String,
+        isFamilySos: ctx['isFamilySos'] == true,
+        userId: ctx['userId'] as String,
+        userName: ctx['userName'] as String,
+        familyCode: (ctx['familyCode'] as String?) ?? '',
+        reportPayload: Map<String, dynamic>.from(ctx['reportPayload'] as Map),
+        location: Map<String, dynamic>.from(ctx['location'] as Map),
+        barangay: (ctx['barangay'] as String?) ?? '',
+        gpsPos: (ctx['gpsLat'] != null && ctx['gpsLng'] != null)
+            ? {
+                'latitude': (ctx['gpsLat'] as num).toDouble(),
+                'longitude': (ctx['gpsLng'] as num).toDouble(),
+              }
+            : null,
+        now: DateTime.parse(ctx['nowIso'] as String),
+        createdAt: ctx['createdAt'] as String,
+        emergencyData: Map<String, dynamic>.from(ctx['emergencyData'] as Map),
+      );
+    } catch (e) {
+      print('❌ persistQueuedReport error: $e');
+      return {'success': false, 'error': 'Error: $e'};
+    }
+  }
+
+  /// Actually writes a fully-resolved report to Firebase. Shared by the
+  /// live send path in [saveReport] and the offline-queue replay in
+  /// [persistQueuedReport] — everything here is the same for both, only
+  /// how the inputs were obtained (fresh vs. replayed from disk) differs.
+  static Future<Map<String, dynamic>> _persistBuiltReport({
+    required String type,
+    required String reportId,
+    required String reportLabel,
+    required bool isFamilySos,
+    required String userId,
+    required String userName,
+    required String familyCode,
+    required Map<String, dynamic> reportPayload,
+    required Map<String, dynamic> location,
+    required String barangay,
+    required Map<String, double>? gpsPos,
+    required DateTime now,
+    required String createdAt,
+    required Map<String, dynamic> emergencyData,
+  }) async {
       if (isFamilySos) {
         // ══════════════════════════════════════════════════════════════════
         // SHAKE SOS → FAMILY ONLY
@@ -313,10 +461,11 @@ class EmergencyReportService {
 
         if (reportResp.statusCode < 200 || reportResp.statusCode >= 300) {
           print('❌ Firebase RTDB PUT failed: ${reportResp.statusCode}');
-          return {
-            'success': false,
-            'error': 'Server error: ${reportResp.statusCode}',
-          };
+          // Thrown (rather than returned in-band) so this funnels through
+          // the same catch as a connectivity failure in both callers —
+          // saveReport() and persistQueuedReport() — keeping "did this
+          // actually get saved" a single code path instead of two.
+          throw Exception('Server error: ${reportResp.statusCode}');
         }
 
         print('✅ RTDB report saved at /$reportLabel/$reportId');
@@ -400,10 +549,6 @@ class EmergencyReportService {
         'reportId': reportId,
         'reportLabel': reportLabel,
       };
-    } catch (e) {
-      print('❌ saveReport error: $e');
-      return {'success': false, 'error': 'Error: $e'};
-    }
   }
 
   // ── Read helpers ──────────────────────────────────────────────────────────
