@@ -1,13 +1,13 @@
-import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../../core/constants/app_colors.dart';
-import '../../../core/utils/photo_cache.dart';
 import '../../../shared/widgets/custom_button.dart';
 import '../../../shared/widgets/custom_text_field.dart';
+import '../../../shared/widgets/photo_avatar.dart';
 import '../../../models/user_model.dart';
+import '../../../services/cloudinary_service.dart';
 import '../../../services/firebase_realtime_database.dart';
 import '../../../services/family_service.dart';
 import '../../dashboard/screens/dashboard_screen.dart';
@@ -99,14 +99,17 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
     setState(() => _isSaving = true);
 
     try {
-      // Encode the new photo first (if any) so we have a data URI to save.
-      // If this fails, the profile fields below are left untouched.
+      // Upload the new photo to Cloudinary first (if any) so we have a URL
+      // to save — instead of embedding it as base64 text directly in the
+      // account's JSON node (see CloudinaryService for why: smaller
+      // upload, and every future view fetches a small optimized variant
+      // instead of the original). If this fails, the profile fields below
+      // are left untouched.
       String? newPhotoUrl;
       if (_pickedPhotoFile != null) {
         setState(() => _isUploadingPhoto = true);
         try {
-          final bytes = await _pickedPhotoFile!.readAsBytes();
-          newPhotoUrl = 'data:image/jpeg;base64,${base64Encode(bytes)}';
+          newPhotoUrl = await CloudinaryService.uploadImage(_pickedPhotoFile!);
         } catch (e) {
           if (!mounted) return;
           setState(() {
@@ -115,7 +118,7 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
           });
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('Failed to process photo: $e'),
+              content: Text('Failed to upload photo: $e'),
               backgroundColor: AppColors.danger,
             ),
           );
@@ -290,18 +293,10 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
 
     final existingPhoto = widget.currentUser.photoUrl;
     if (!_removePhoto && existingPhoto.isNotEmpty) {
-      // Cached decode — see PhotoCache.
-      final bytes = PhotoCache.decode(existingPhoto);
-      if (bytes == null) return _buildInitialsAvatar();
-      return Image.memory(
-        bytes,
-        width: 120,
-        height: 120,
-        fit: BoxFit.cover,
-        cacheWidth: 360,
-        cacheHeight: 360,
-        gaplessPlayback: true,
-        errorBuilder: (context, error, stackTrace) => _buildInitialsAvatar(),
+      return PhotoAvatar(
+        photoUrl: existingPhoto,
+        size: 120,
+        initials: _buildInitialsAvatar(),
       );
     }
 
@@ -493,13 +488,16 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
   Future<void> _pickPhoto(ImageSource source) async {
     try {
       final picker = ImagePicker();
-      // Kept small since the photo is embedded as base64 text directly in
-      // the Realtime Database record rather than uploaded to Storage.
+      // Cloudinary generates the actual delivery-size variants on demand
+      // (see CloudinaryService.deliveryUrl), so this only needs to cap the
+      // one-time upload at a reasonable source resolution — not the tiny
+      // 320px this was kept at back when the photo itself was embedded as
+      // base64 text in the database record.
       final pickedFile = await picker.pickImage(
         source: source,
-        maxWidth: 320,
-        maxHeight: 320,
-        imageQuality: 60,
+        maxWidth: 800,
+        maxHeight: 800,
+        imageQuality: 80,
       );
 
       // User cancelled the picker — leave the current photo untouched.

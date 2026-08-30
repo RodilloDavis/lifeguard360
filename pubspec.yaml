@@ -21,6 +21,7 @@ dependencies:
 
   # Image picking
   image_picker: ^1.1.2
+  cached_network_image: ^3.4.1
   
   # Maps & Location
   flutter_map: ^8.2.2

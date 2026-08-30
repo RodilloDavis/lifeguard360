@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../../core/constants/app_colors.dart';
-import '../../../core/utils/photo_cache.dart';
+import '../../../shared/widgets/photo_avatar.dart';
 import '../../../services/firebase_realtime_database.dart';
 import '../../../models/user_model.dart';
 import '../../../models/family_model.dart';
@@ -447,22 +447,10 @@ class _ProfileScreenState extends State<ProfileScreen> {
   /// when there is none or the stored data is malformed.
   Widget _buildHeaderAvatarContent() {
     final photoData = _currentUser?.photoUrl ?? '';
-    // Cached decode — see PhotoCache. Also lets the image cache hit across
-    // rebuilds instead of re-decoding the photo each time.
-    final bytes = PhotoCache.decode(photoData);
-    if (bytes == null) return _buildHeaderInitials();
-
-    return Image.memory(
-      bytes,
-      width: 100,
-      height: 100,
-      fit: BoxFit.cover,
-      // Decoded near display size (100 logical px at up to ~3x density)
-      // rather than at the source photo's full camera resolution.
-      cacheWidth: 300,
-      cacheHeight: 300,
-      gaplessPlayback: true,
-      errorBuilder: (context, error, stackTrace) => _buildHeaderInitials(),
+    return PhotoAvatar(
+      photoUrl: photoData,
+      size: 100,
+      initials: _buildHeaderInitials(),
     );
   }
 

@@ -5,7 +5,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import '../../../core/constants/app_colors.dart';
-import '../../../core/utils/photo_cache.dart';
+import '../../../shared/widgets/photo_avatar.dart';
 import '../../../shared/widgets/custom_button.dart';
 import '../../emergency/screens/emergency_selection_screen.dart';
 import '../../map/screens/map_screen.dart';
@@ -1422,34 +1422,16 @@ class _DashboardHomeState extends State<DashboardHome>
       ),
     );
 
-    // Cached: this list rebuilds on a 10-second presence poll, and decoding
-    // every member's photo inline on each of those rebuilds was re-doing
-    // both the base64 AND the image decode every tick. See PhotoCache.
-    final bytes = PhotoCache.decode(photoUrl);
-
+    // This list rebuilds on a 10-second presence poll — PhotoAvatar caches
+    // the decoded base64 bytes (PhotoCache) or the fetched network image
+    // (CachedNetworkImage) so that rebuild never re-does the actual photo
+    // work, only the cheap lookup.
     return CircleAvatar(
       radius: 24,
       backgroundColor: backgroundColor,
-      child: bytes == null
-          ? initials
-          : ClipOval(
-              child: Image.memory(
-                bytes,
-                width: 48,
-                height: 48,
-                fit: BoxFit.cover,
-                // Decode to roughly the size actually drawn (48 logical px
-                // at up to ~3x density) instead of at the photo's full
-                // resolution. A camera-sized source image otherwise costs
-                // megabytes of decode and memory to paint a 48px circle.
-                cacheWidth: 144,
-                cacheHeight: 144,
-                // Keeps the previous frame's pixels while a re-decode
-                // resolves, so avatars don't blink on rebuild.
-                gaplessPlayback: true,
-                errorBuilder: (context, error, stackTrace) => initials,
-              ),
-            ),
+      child: ClipOval(
+        child: PhotoAvatar(photoUrl: photoUrl, size: 48, initials: initials),
+      ),
     );
   }
 
