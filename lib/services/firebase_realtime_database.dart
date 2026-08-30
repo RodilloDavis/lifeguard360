@@ -701,9 +701,14 @@ class FirebaseService {
   static Future<List<Map<String, dynamic>>> getFamilyMembers(
       String familyCode) async {
     try {
-      final response = await http
-          .get(Uri.parse('${dbUrl}Families/$familyCode/Members.json'))
-          .timeout(const Duration(seconds: 30));
+      // Routed through CachedHttpGet (rather than a bare http.get) so the
+      // member list — which changes rarely — is served from disk on a
+      // weak/offline connection instead of blocking or failing outright.
+      final response = await CachedHttpGet.get(
+        Uri.parse('${dbUrl}Families/$familyCode/Members.json'),
+        ttl: const Duration(seconds: 20),
+        timeout: const Duration(seconds: 30),
+      );
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
@@ -735,9 +740,15 @@ class FirebaseService {
     }
 
     try {
-      final membersResp = await http
-          .get(Uri.parse('${dbUrl}Families/$familyCode/Members.json'))
-          .timeout(const Duration(seconds: 15));
+      // Same reasoning as getFamilyMembers above — this runs on the
+      // dashboard/map's 10s poll, so serving the last-known member list
+      // from disk on a weak connection (rather than every poll blocking on
+      // a slow request for data that rarely changes) matters here most.
+      final membersResp = await CachedHttpGet.get(
+        Uri.parse('${dbUrl}Families/$familyCode/Members.json'),
+        ttl: const Duration(seconds: 20),
+        timeout: const Duration(seconds: 15),
+      );
 
       print(
           '📡 Members response [${membersResp.statusCode}] for code: $familyCode');

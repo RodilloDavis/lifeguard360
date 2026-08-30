@@ -602,6 +602,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'core/constants/app_colors.dart';
 import 'firebase_options.dart';
 import 'services/background_service.dart';
+import 'services/connectivity_quality_service.dart';
 import 'services/fcm_service.dart';
 import 'services/offline_report_queue_service.dart';
 import 'features/auth/screens/login_screen.dart';
@@ -922,6 +923,12 @@ void main() async {
       // foreground. Fired before anything else in this block so it clears
       // as fast as possible.
       await OverlayService.hide();
+
+      // Starts the connection-quality probe that CachedHttpGet uses to
+      // decide when to serve cached data instead of hitting the network,
+      // and when to invalidate its cache so already-open screens resync
+      // automatically the moment a weak/dropped connection recovers.
+      ConnectivityQualityService.init();
 
       // Starts the connectivity listener and makes a best-effort attempt
       // to send anything left over in the offline report queue from a
