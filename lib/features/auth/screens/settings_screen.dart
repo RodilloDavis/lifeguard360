@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../../../core/constants/app_colors.dart';
 import '../../../services/background_service.dart';
 import '../../../services/firebase_realtime_database.dart';
+import '../../../services/family_members_cache_service.dart';
 import '../../auth/screens/login_screen.dart';
 import '../../contacts/screens/alert_contact_screen.dart';
 import '../../dashboard/screens/family_settings_screen.dart';
@@ -425,6 +426,13 @@ class _SettingsScreenState extends State<SettingsScreen>
     // straight back into the dashboard.
     try {
       final prefs = await SharedPreferences.getInstance();
+      final familyCode = prefs.getString('familyCode') ?? '';
+      // Drop the cached family/member list too — otherwise a different
+      // account logging in on this same device would instant-paint from
+      // this account's family data before its own fetch ever lands.
+      if (familyCode.isNotEmpty) {
+        await FamilyMembersCacheService.clear(familyCode);
+      }
       await prefs.remove('userId');
       await prefs.remove('userName');
       await prefs.remove('familyCode');

@@ -24,6 +24,7 @@ import '../../../services/notification_count_service.dart';
 import '../../emergency/screens/my_reports_screen.dart';
 import '../../map/screens/member_directions_screen.dart';
 import '../../../services/emergency_status_service.dart';
+import '../../../services/family_members_cache_service.dart';
 
 class DashboardScreen extends StatefulWidget {
   final String userId;
@@ -71,7 +72,13 @@ class _DashboardScreenState extends State<DashboardScreen>
     WidgetsBinding.instance.addObserver(this);
     OnlineStatusService.instance.initialize(widget.userId);
     FirebaseService.startLocationTracking(widget.userId);
-    _pollUnreadCount();
+
+    _unreadStreamController = StreamController<int>.broadcast();
+    NotificationCountService.instance.addListener(_unreadStreamController!);
+    _unreadStreamController!.stream.listen((count) {
+      if (!_disposed && mounted) setState(() => _unreadCount = count);
+    });
+    NotificationCountService.instance.startPolling(widget.userId);
 
     // Start emergency status polling for this family
     _loadFamilyCodeAndStartPolling();
@@ -101,53 +108,23 @@ class _DashboardScreenState extends State<DashboardScreen>
     }
   }
 
-  Timer? _unreadTimer;
+  StreamController<int>? _unreadStreamController;
 
   @override
   void dispose() {
     _disposed = true;
     WidgetsBinding.instance.removeObserver(this);
     FirebaseService.stopLocationTracking();
-    _unreadTimer?.cancel();
+    if (_unreadStreamController != null) {
+      NotificationCountService.instance
+          .removeListener(_unreadStreamController!);
+      _unreadStreamController!.close();
+    }
     EmergencyStatusService.instance.dispose();
     FlutterBackgroundService().invoke('appForeground', {'foreground': false});
     _shakeStartedSub?.cancel();
     _shakeEndedSub?.cancel();
     super.dispose();
-  }
-
-  Future<void> _pollUnreadCount() async {
-    await _refreshUnreadCount();
-    _unreadTimer = Timer.periodic(
-      const Duration(seconds: 10),
-      (_) => _refreshUnreadCount(),
-    );
-  }
-
-  Future<void> _refreshUnreadCount() async {
-    if (_disposed) return;
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      var familyCode = prefs.getString('familyCode') ?? '';
-      if (familyCode.isEmpty) {
-        final account = await FirebaseService.getUserById(widget.userId);
-        familyCode = account?['familyCode']?.toString() ?? '';
-      }
-      if (_disposed) return;
-
-      // throwOnError so a dropped poll lands in the catch below instead of
-      // silently resolving to 0 — which would otherwise hide the badge on a
-      // network hiccup even when there really are unread items.
-      final unread = await NotificationCountService.unreadCount(
-        userId: widget.userId,
-        familyCode: familyCode,
-        throwOnError: true,
-      );
-
-      if (!_disposed && mounted) setState(() => _unreadCount = unread);
-    } catch (_) {
-      // Leave _unreadCount as whatever it already was.
-    }
   }
 
   @override
@@ -168,11 +145,7 @@ class _DashboardScreenState extends State<DashboardScreen>
         FirebaseService.startLocationTracking(widget.userId);
         FlutterBackgroundService()
             .invoke('appForeground', {'foreground': true});
-        _unreadTimer ??= Timer.periodic(
-          const Duration(seconds: 10),
-          (_) => _refreshUnreadCount(),
-        );
-        _refreshUnreadCount(); // catch up immediately
+        NotificationCountService.instance.resume();
         EmergencyStatusService.instance.resume();
         break;
       case AppLifecycleState.paused:
@@ -185,8 +158,7 @@ class _DashboardScreenState extends State<DashboardScreen>
         // FCM push plus the background service, both unaffected by this.
         // These are just UI-refresh polls, so no point paying for the
         // network round-trip behind a screen nobody can see.
-        _unreadTimer?.cancel();
-        _unreadTimer = null;
+        NotificationCountService.instance.pause();
         EmergencyStatusService.instance.pause();
         break;
       case AppLifecycleState.inactive:
@@ -599,7 +571,6 @@ class _DashboardHomeState extends State<DashboardHome>
 
   Future<void> _loadUserFamily() async {
     if (!mounted) return;
-    setState(() => _isLoading = true);
 
     // getUserById swallows network errors and returns null on failure (see
     // FirebaseService.getUserById), so a plain offline cold start — no
@@ -623,10 +594,44 @@ class _DashboardHomeState extends State<DashboardHome>
       }
     }
 
+    // Instant paint: if this family's member list is already on disk from
+    // an earlier load (this session or a previous one), show it right away
+    // instead of blocking on a network round trip first — this is what
+    // makes both a cold app open AND a pull-to-refresh feel instant instead
+    // of flashing back to a full-screen spinner every time. The real fetch
+    // below always still runs afterwards to bring this up to date.
+    var paintedFromCache = false;
+    if (_familyCode.isNotEmpty) {
+      final cached = await FamilyMembersCacheService.getCachedFamily(_familyCode);
+      if (cached != null && mounted) {
+        final cachedFamilyCode = _familyCode;
+        final members =
+            List<Map<String, dynamic>>.from(cached['members'] as List);
+        EmergencyStatusService.instance.startPolling(cachedFamilyCode);
+        setState(() {
+          _familyName = cached['familyName']?.toString() ?? _familyName;
+          _isAdmin = (cached['createdBy']?.toString() ?? '') == widget.userId;
+          _familyMembers = members;
+          _isLoading = false;
+          _activeEmergencyUserIds = EmergencyStatusService.instance
+              .getActiveEmergencyUserIds(cachedFamilyCode);
+        });
+        paintedFromCache = true;
+      }
+    }
+
+    // Only the true first-ever load (nothing cached, nothing on screen yet)
+    // should show the blocking spinner — every other call to this method
+    // (pull-to-refresh, return-from-profile, etc.) already painted from
+    // cache above and refreshes silently in place instead.
+    if (!paintedFromCache && mounted) {
+      setState(() => _isLoading = true);
+    }
+
     try {
       final account = await FirebaseService.getUserById(widget.userId);
       if (account == null) {
-        if (mounted) setState(() => _isLoading = false);
+        if (mounted && !paintedFromCache) setState(() => _isLoading = false);
         return;
       }
 
@@ -646,40 +651,22 @@ class _DashboardHomeState extends State<DashboardHome>
         return;
       }
 
-      final family = await FirebaseService.getFamilyByCode(familyCode);
-      if (family == null) {
-        if (mounted) setState(() => _isLoading = false);
+      final synced = await FamilyMembersCacheService.syncAndGetFamily(
+        familyCode,
+        userId: widget.userId,
+      );
+      if (synced == null) {
+        // Fetch genuinely failed (or the family no longer exists) — leave
+        // whatever's already on screen (cache-painted or empty) alone
+        // rather than blanking it out on a single dropped request.
+        if (mounted && !paintedFromCache) setState(() => _isLoading = false);
         return;
       }
 
-      final familyName = family['FamilyName']?.toString() ?? '';
-      final createdBy = family['CreatedBy']?.toString() ?? '';
-      final membersRaw = family['Members'];
-
-      final List<Map<String, dynamic>> members = [];
-      if (membersRaw != null && membersRaw is Map) {
-        membersRaw.forEach((key, value) {
-          if (value is Map) {
-            members.add({
-              'userId': value['UserId']?.toString() ?? key.toString(),
-              'name': value['Name']?.toString() ?? 'Unknown',
-              'role': value['Role']?.toString() ?? 'Member',
-              'joinedAt': value['JoinedAt']?.toString() ?? '',
-              'status': 'Online',
-            });
-          }
-        });
-      }
-
-      members.sort((a, b) {
-        if (a['userId'] == widget.userId) return -1;
-        if (b['userId'] == widget.userId) return 1;
-        if (a['role'] == 'Admin') return -1;
-        if (b['role'] == 'Admin') return 1;
-        return a['name'].compareTo(b['name']);
-      });
-
-      await _loadMemberStatuses(members, familyCode);
+      final members =
+          List<Map<String, dynamic>>.from(synced['members'] as List);
+      final familyName = synced['familyName']?.toString() ?? '';
+      final createdBy = synced['createdBy']?.toString() ?? '';
 
       // Started only NOW that we're about to set _familyCode, rather than
       // right after the family lookup several awaits above. Starting it
@@ -689,6 +676,8 @@ class _DashboardHomeState extends State<DashboardHome>
       // (empty) value. Since EmergencyStatusService only notifies on a state
       // CHANGE, that wrong read was never corrected afterwards — a member
       // already mid-emergency at load time would silently never turn red.
+      // (Idempotent — a no-op if the cache-paint step above already started
+      // polling this same family code.)
       EmergencyStatusService.instance.startPolling(familyCode);
 
       if (mounted) {
@@ -717,7 +706,7 @@ class _DashboardHomeState extends State<DashboardHome>
       }
     } catch (e) {
       print('❌ Error loading family: $e');
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted && !paintedFromCache) setState(() => _isLoading = false);
     }
   }
 

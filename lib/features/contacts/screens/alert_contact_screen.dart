@@ -29,7 +29,7 @@ class AlertContactScreen extends StatefulWidget {
 class _AlertContactScreenState extends State<AlertContactScreen> {
   int _selectedIndex = 3; // Settings tab (since accessed from Profile/Settings)
   int _unreadCount = 0;
-  Timer? _unreadTimer;
+  StreamController<int>? _unreadStreamController;
   String? _resolvedUserId;
 
   final List<Map<String, dynamic>> _contacts = [
@@ -68,14 +68,33 @@ class _AlertContactScreenState extends State<AlertContactScreen> {
   @override
   void initState() {
     super.initState();
-    _pollUnreadCount();
+    _unreadStreamController = StreamController<int>.broadcast();
+    NotificationCountService.instance.addListener(_unreadStreamController!);
+    _unreadStreamController!.stream.listen((count) {
+      if (mounted) setState(() => _unreadCount = count);
+    });
+    _startUnreadPolling();
     _loadPersonalContacts();
   }
 
   @override
   void dispose() {
-    _unreadTimer?.cancel();
+    if (_unreadStreamController != null) {
+      NotificationCountService.instance
+          .removeListener(_unreadStreamController!);
+      _unreadStreamController!.close();
+    }
     super.dispose();
+  }
+
+  /// This screen is often opened without a userId (see _getUserId), so the
+  /// singleton poller can't be started synchronously in initState — resolve
+  /// it first, same as _loadPersonalContacts already does.
+  Future<void> _startUnreadPolling() async {
+    final userId = await _getUserId() ?? '';
+    if (userId.isNotEmpty) {
+      NotificationCountService.instance.startPolling(userId);
+    }
   }
 
   /// This screen can be opened without a userId (dashboard's shortcut passes
@@ -108,43 +127,6 @@ class _AlertContactScreenState extends State<AlertContactScreen> {
             'type': 'personal',
           }));
     });
-  }
-
-  Future<void> _pollUnreadCount() async {
-    await _refreshUnreadCount();
-    _unreadTimer = Timer.periodic(
-      const Duration(seconds: 10),
-      (_) => _refreshUnreadCount(),
-    );
-  }
-
-  Future<void> _refreshUnreadCount() async {
-    try {
-      // The count is per-user now (a member's own reports must not light up
-      // their own badge), so resolve the session userId rather than relying
-      // on the widget arg this screen is often opened without.
-      final userId = await _getUserId() ?? '';
-      if (userId.isEmpty) return;
-
-      final prefs = await SharedPreferences.getInstance();
-      var familyCode = prefs.getString('familyCode') ?? '';
-      if (familyCode.isEmpty) {
-        final account = await FirebaseService.getUserById(userId);
-        familyCode = account?['familyCode']?.toString() ?? '';
-      }
-      // No early return on an empty familyCode: updates on the user's own
-      // reports (responder assigned / resolved) still count without one.
-
-      final unread = await NotificationCountService.unreadCount(
-        userId: userId,
-        familyCode: familyCode,
-        throwOnError: true,
-      );
-
-      if (mounted) setState(() => _unreadCount = unread);
-    } catch (_) {
-      // Leave _unreadCount as whatever it already was.
-    }
   }
 
   List<Map<String, dynamic>> get _verifiedContacts =>

@@ -1086,7 +1086,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
 
   // ── Notification badge ──────────────────────────────────────────────────
   int _unreadCount = 0;
-  Timer? _unreadTimer;
+  StreamController<int>? _unreadStreamController;
 
   // ── Colours ───────────────────────────────────────────────────────────────
   static const List<double> _markerHues = [
@@ -1118,7 +1118,16 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _initialize();
-    _pollUnreadCount();
+
+    _unreadStreamController = StreamController<int>.broadcast();
+    NotificationCountService.instance.addListener(_unreadStreamController!);
+    _unreadStreamController!.stream.listen((count) {
+      if (!_disposed && mounted) setState(() => _unreadCount = count);
+    });
+    final userId = widget.userId ?? '';
+    if (userId.isNotEmpty) {
+      NotificationCountService.instance.startPolling(userId);
+    }
   }
 
   @override
@@ -1126,7 +1135,11 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     _disposed = true;
     WidgetsBinding.instance.removeObserver(this);
     _refreshTimer?.cancel();
-    _unreadTimer?.cancel();
+    if (_unreadStreamController != null) {
+      NotificationCountService.instance
+          .removeListener(_unreadStreamController!);
+      _unreadStreamController!.close();
+    }
     _mapController?.dispose();
     super.dispose();
   }
@@ -1152,41 +1165,6 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   // Notification badge
   // ══════════════════════════════════════════════════════════════════════════
 
-  Future<void> _pollUnreadCount() async {
-    await _refreshUnreadCount();
-    _unreadTimer = Timer.periodic(
-      const Duration(seconds: 10),
-      (_) => _refreshUnreadCount(),
-    );
-  }
-
-  Future<void> _refreshUnreadCount() async {
-    if (_disposed) return;
-    try {
-      var familyCode = _resolvedFamilyCode;
-      if (familyCode.isEmpty) {
-        final account = await FirebaseService.getUserById(widget.userId ?? '');
-        if (_disposed) return;
-        familyCode = account?['familyCode']?.toString() ?? '';
-        if (familyCode.isNotEmpty && mounted) {
-          setState(() => _resolvedFamilyCode = familyCode);
-        }
-      }
-      // No early return on an empty familyCode: updates on the user's own
-      // reports (responder assigned / resolved) still count without one.
-
-      final unread = await NotificationCountService.unreadCount(
-        userId: widget.userId ?? '',
-        familyCode: familyCode,
-        throwOnError: true,
-      );
-
-      if (!_disposed && mounted) setState(() => _unreadCount = unread);
-    } catch (_) {
-      // Leave _unreadCount as whatever it already was.
-    }
-  }
-
   void _navigateToNotifications() {
     Navigator.push(
       context,
@@ -1196,7 +1174,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
           familyCode: _resolvedFamilyCode,
         ),
       ),
-    ).then((_) => _refreshUnreadCount());
+    ).then((_) => NotificationCountService.instance.refreshNow());
   }
 
   // ══════════════════════════════════════════════════════════════════════════

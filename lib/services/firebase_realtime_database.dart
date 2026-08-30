@@ -571,6 +571,12 @@ class FirebaseService {
           familyRole: 'Admin',
         );
 
+        // A fresh family/account just came into existence — nothing about
+        // it can be sitting in the cache yet, but the account node itself
+        // (getUserById) may be, and the moment the caller re-reads it must
+        // see the new familyCode rather than a stale empty one.
+        CachedHttpGet.invalidateAll();
+
         print('✅ Creator account updated with family info');
         print('=================================================');
 
@@ -653,6 +659,12 @@ class FirebaseService {
           familyRole: role,
         );
 
+        // Cached copies of this account and this family's member list are
+        // now stale (both getUserById and getFamilyByCode/getFamilyMembers
+        // are CachedHttpGet-backed) — clear them so the dashboard's next
+        // load sees the new member instead of whatever TTL is left.
+        CachedHttpGet.invalidateAll();
+
         print('✅ Member account updated with family info');
         print('=================================================');
 
@@ -681,9 +693,16 @@ class FirebaseService {
   static Future<Map<String, dynamic>?> getFamilyByCode(
       String familyCode) async {
     try {
-      final response = await http
-          .get(Uri.parse('${dbUrl}Families/$familyCode.json'))
-          .timeout(const Duration(seconds: 30));
+      // Routed through CachedHttpGet — matches the 20s TTL already used for
+      // the sibling Members.json fetch in getFamilyMembers below (same
+      // Families/{code} subtree), and means this respects
+      // ConnectivityQualityService: on a weak/offline connection it serves
+      // the last disk-cached response instead of attempting the network.
+      final response = await CachedHttpGet.get(
+        Uri.parse('${dbUrl}Families/$familyCode.json'),
+        ttl: const Duration(seconds: 20),
+        timeout: const Duration(seconds: 30),
+      );
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
@@ -905,6 +924,7 @@ class FirebaseService {
 
       if (removeResponse.statusCode >= 200 && removeResponse.statusCode < 300) {
         await _clearAccountFamilyFields(userId);
+        CachedHttpGet.invalidateAll();
         print('✅ User left family successfully');
         return {'success': true, 'message': 'You have left the family.'};
       } else {
@@ -940,6 +960,7 @@ class FirebaseService {
           .timeout(const Duration(seconds: 30));
 
       if (deleteResponse.statusCode >= 200 && deleteResponse.statusCode < 300) {
+        CachedHttpGet.invalidateAll();
         print('✅ Family deleted successfully');
         return {'success': true, 'message': 'Family deleted successfully.'};
       } else {
@@ -986,6 +1007,7 @@ class FirebaseService {
       );
       await _patchAccountField(newAdminId, 'FamilyRole', 'Admin');
 
+      CachedHttpGet.invalidateAll();
       print('✅ Admin transferred to $newAdminName');
       return {'success': true, 'message': 'Admin rights transferred.'};
     } catch (e) {
@@ -1470,8 +1492,18 @@ class FirebaseService {
 
   static Future<Map<String, dynamic>?> getUserById(String userId) async {
     try {
-      final response =
-          await http.get(Uri.parse('${dbUrl}Accounts/$userId.json'));
+      // Routed through CachedHttpGet with a generous 60s TTL — every real
+      // call site only actually needs familyCode out of this whole node,
+      // and that only changes on a deliberate join/leave (see the
+      // CachedHttpGet.invalidateAll() calls next to those actions), not
+      // passively over time. Also makes this respect
+      // ConnectivityQualityService the same way the rest of the app's
+      // polling already does.
+      final response = await CachedHttpGet.get(
+        Uri.parse('${dbUrl}Accounts/$userId.json'),
+        ttl: const Duration(seconds: 60),
+        timeout: const Duration(seconds: 15),
+      );
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
         if (data != null) {
