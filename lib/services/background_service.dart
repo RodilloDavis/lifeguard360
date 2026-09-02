@@ -42,6 +42,21 @@ const String _kShakeChannelName = 'LifeGuard360 SHAKE SOS';
 const String _kReportUpdateChannelId = 'lifeguard_report_resolved';
 const String _kReportUpdateChannelName = 'LifeGuard360 Report Updates';
 
+// Separate ids used for these same four channels once the user has granted
+// Do Not Disturb access (see Settings > Do Not Disturb), instead of
+// reusing the plain id with bypassDnd flipped on. Android locks a
+// channel's bypassDnd — like its sound or importance — at the moment the
+// channel is first created, and silently ignores any change after that
+// (see AppBackgroundService._buildChannels). A distinct id means the very
+// first time access is granted, this is an id Android has never seen
+// before, so creating it with bypassDnd: true actually sticks. Before that
+// grant, every app start just keeps re-declaring the plain id it already
+// made (a no-op), so nothing changes for anyone who hasn't granted access.
+const String _kAlertChannelIdDnd = 'lifeguard_sos_alerts_dnd';
+const String _kReportChannelIdDnd = 'lifeguard_reports_dnd';
+const String _kShakeChannelIdDnd = 'lifeguard_shake_sos_dnd';
+const String _kReportUpdateChannelIdDnd = 'lifeguard_report_resolved_dnd';
+
 // ─── Shake detection constants ─────────────────────────────────────────────────
 const double _kShakeThreshold = 4.5 * 9.81;
 const double _kIntenseThreshold = 7.0 * 9.81;
@@ -125,7 +140,7 @@ class AppBackgroundService {
     final androidPlugin = _bgFlnp.resolvePlatformSpecificImplementation<
         AndroidFlutterLocalNotificationsPlugin>();
 
-    for (final channel in _allChannels) {
+    for (final channel in await _buildChannels()) {
       await androidPlugin?.createNotificationChannel(channel);
     }
 
@@ -161,50 +176,74 @@ class AppBackgroundService {
     );
   }
 
-  static final List<AndroidNotificationChannel> _allChannels = [
-    const AndroidNotificationChannel(
-      _kForegroundChannelId,
-      _kForegroundChannelName,
-      importance: Importance.low,
-      description: 'Shown while LifeGuard360 tracks your location',
-      playSound: false,
-      enableVibration: false,
-      showBadge: false,
-    ),
-    const AndroidNotificationChannel(
-      _kAlertChannelId,
-      _kAlertChannelName,
-      importance: Importance.max,
-      description: 'SOS and emergency alerts from your family',
-      playSound: true,
-      enableVibration: true,
-    ),
-    const AndroidNotificationChannel(
-      _kReportChannelId,
-      _kReportChannelName,
-      importance: Importance.high,
-      description: 'New emergency reports from your family circle',
-      playSound: true,
-      enableVibration: true,
-    ),
-    const AndroidNotificationChannel(
-      _kShakeChannelId,
-      _kShakeChannelName,
-      importance: Importance.max,
-      description: 'Shake SOS emergency alerts',
-      playSound: true,
-      enableVibration: true,
-    ),
-    const AndroidNotificationChannel(
-      _kReportUpdateChannelId,
-      _kReportUpdateChannelName,
-      importance: Importance.high,
-      description: 'Updates on reports you submitted — when a responder is '
-          'assigned, and when the report is resolved',
-      playSound: true,
-      enableVibration: true,
-    ),
-  ];
+  // Built fresh (not a static const list) because whether the four alert
+  // channels get created with bypassDnd: true depends on whether the user
+  // has granted Do Not Disturb access — see _alertChannelId's doc comment
+  // for why that has to decide the channel's *id*, not just a flag on it.
+  static Future<List<AndroidNotificationChannel>> _buildChannels() async {
+    final dndGranted = await _hasDndAccess();
+    return [
+      const AndroidNotificationChannel(
+        _kForegroundChannelId,
+        _kForegroundChannelName,
+        importance: Importance.low,
+        description: 'Shown while LifeGuard360 tracks your location',
+        playSound: false,
+        enableVibration: false,
+        showBadge: false,
+      ),
+      AndroidNotificationChannel(
+        dndGranted ? _kAlertChannelIdDnd : _kAlertChannelId,
+        _kAlertChannelName,
+        importance: Importance.max,
+        description: 'SOS and emergency alerts from your family',
+        playSound: true,
+        enableVibration: true,
+        bypassDnd: dndGranted,
+      ),
+      AndroidNotificationChannel(
+        dndGranted ? _kReportChannelIdDnd : _kReportChannelId,
+        _kReportChannelName,
+        importance: Importance.high,
+        description: 'New emergency reports from your family circle',
+        playSound: true,
+        enableVibration: true,
+        bypassDnd: dndGranted,
+      ),
+      AndroidNotificationChannel(
+        dndGranted ? _kShakeChannelIdDnd : _kShakeChannelId,
+        _kShakeChannelName,
+        importance: Importance.max,
+        description: 'Shake SOS emergency alerts',
+        playSound: true,
+        enableVibration: true,
+        bypassDnd: dndGranted,
+      ),
+      AndroidNotificationChannel(
+        dndGranted ? _kReportUpdateChannelIdDnd : _kReportUpdateChannelId,
+        _kReportUpdateChannelName,
+        importance: Importance.high,
+        description: 'Updates on reports you submitted — when a responder is '
+            'assigned, and when the report is resolved',
+        playSound: true,
+        enableVibration: true,
+        bypassDnd: dndGranted,
+      ),
+    ];
+  }
+
+  /// Re-creates the alert channels immediately, picking up Do Not Disturb
+  /// access if the user just granted it. Safe to call any time — if access
+  /// is still not granted, or the "_dnd" channels already exist from an
+  /// earlier call, this is a harmless no-op re-declaration.
+  static Future<void> refreshAlertChannels() async {
+    if (kIsWeb) return;
+    final androidPlugin = _bgFlnp.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>();
+    for (final channel in await _buildChannels()) {
+      await androidPlugin?.createNotificationChannel(channel);
+    }
+  }
 
   static Future<void> start() async {
     if (kIsWeb) return;
@@ -292,14 +331,21 @@ Future<bool> _iosBackground(ServiceInstance service) async {
 // NOTIFICATION HELPERS
 // =============================================================================
 
+Future<bool> _hasDndAccess() async {
+  final androidPlugin = _bgFlnp.resolvePlatformSpecificImplementation<
+      AndroidFlutterLocalNotificationsPlugin>();
+  return (await androidPlugin?.hasNotificationPolicyAccess()) ?? false;
+}
+
 Future<void> _showSosAlert(String senderName) async {
+  final dndGranted = await _hasDndAccess();
   await _bgFlnp.show(
     id: DateTime.now().millisecondsSinceEpoch ~/ 1000,
     title: '🚨 SOS Alert!',
     body: '$senderName needs help! Open the app immediately.',
-    notificationDetails: const NotificationDetails(
+    notificationDetails: NotificationDetails(
       android: AndroidNotificationDetails(
-        _kAlertChannelId,
+        dndGranted ? _kAlertChannelIdDnd : _kAlertChannelId,
         _kAlertChannelName,
         importance: Importance.max,
         priority: Priority.max,
@@ -307,9 +353,10 @@ Future<void> _showSosAlert(String senderName) async {
         playSound: true,
         enableVibration: true,
         icon: '@mipmap/ic_launcher',
-        color: Color(0xFFCC0000),
+        color: const Color(0xFFCC0000),
+        channelBypassDnd: dndGranted,
       ),
-      iOS: DarwinNotificationDetails(
+      iOS: const DarwinNotificationDetails(
         presentAlert: true,
         presentBadge: true,
         presentSound: true,
@@ -339,13 +386,14 @@ Future<void> _showReportAlert(String reporterName, String reportType) async {
       }[reportType] ??
       'Emergency Report';
 
+  final dndGranted = await _hasDndAccess();
   await _bgFlnp.show(
     id: (DateTime.now().millisecondsSinceEpoch ~/ 1000) + 1,
     title: '$emoji $label from $reporterName',
     body: 'Tap to view the report and take action.',
     notificationDetails: NotificationDetails(
       android: AndroidNotificationDetails(
-        _kReportChannelId,
+        dndGranted ? _kReportChannelIdDnd : _kReportChannelId,
         _kReportChannelName,
         importance: Importance.max,
         priority: Priority.max,
@@ -355,6 +403,7 @@ Future<void> _showReportAlert(String reporterName, String reportType) async {
         icon: '@mipmap/ic_launcher',
         color: const Color(0xFFCC0000),
         fullScreenIntent: true,
+        channelBypassDnd: dndGranted,
       ),
       iOS: const DarwinNotificationDetails(
         presentAlert: true,
@@ -391,6 +440,7 @@ Future<void> _showReportResolvedAlert({
   ];
   final body = lines.join('\n');
 
+  final dndGranted = await _hasDndAccess();
   await _bgFlnp.show(
     // Derived from the report ID rather than the clock, so a re-delivery for
     // the same report replaces its tray entry instead of stacking a copy.
@@ -399,7 +449,7 @@ Future<void> _showReportResolvedAlert({
     body: body,
     notificationDetails: NotificationDetails(
       android: AndroidNotificationDetails(
-        _kReportUpdateChannelId,
+        dndGranted ? _kReportUpdateChannelIdDnd : _kReportUpdateChannelId,
         _kReportUpdateChannelName,
         importance: Importance.high,
         priority: Priority.high,
@@ -407,6 +457,7 @@ Future<void> _showReportResolvedAlert({
         enableVibration: true,
         icon: '@mipmap/ic_launcher',
         color: const Color(0xFF28A745),
+        channelBypassDnd: dndGranted,
         // The details run past one line — expand them instead of truncating
         // the date/time the user is being told about.
         styleInformation: BigTextStyleInformation(
@@ -451,6 +502,7 @@ Future<void> _showResponderAssignedAlert({
   ];
   final body = lines.join('\n');
 
+  final dndGranted = await _hasDndAccess();
   await _bgFlnp.show(
     // Distinct from the resolved alert's ID for the same report, so the two
     // stages sit side by side in the tray instead of one replacing the other.
@@ -459,7 +511,7 @@ Future<void> _showResponderAssignedAlert({
     body: body,
     notificationDetails: NotificationDetails(
       android: AndroidNotificationDetails(
-        _kReportUpdateChannelId,
+        dndGranted ? _kReportUpdateChannelIdDnd : _kReportUpdateChannelId,
         _kReportUpdateChannelName,
         importance: Importance.high,
         priority: Priority.high,
@@ -467,6 +519,7 @@ Future<void> _showResponderAssignedAlert({
         enableVibration: true,
         icon: '@mipmap/ic_launcher',
         color: const Color(0xFF0088CC),
+        channelBypassDnd: dndGranted,
         styleInformation:
             BigTextStyleInformation(body, contentTitle: title),
       ),
@@ -480,20 +533,22 @@ Future<void> _showResponderAssignedAlert({
 }
 
 Future<void> _showShakeSosSentConfirmation() async {
+  final dndGranted = await _hasDndAccess();
   await _bgFlnp.show(
     id: (DateTime.now().millisecondsSinceEpoch ~/ 1000) + 3,
     title: '📳 Shake SOS Sent',
     body: 'Your family has been alerted. Help is on the way.',
-    notificationDetails: const NotificationDetails(
+    notificationDetails: NotificationDetails(
       android: AndroidNotificationDetails(
-        _kShakeChannelId,
+        dndGranted ? _kShakeChannelIdDnd : _kShakeChannelId,
         _kShakeChannelName,
         importance: Importance.high,
         priority: Priority.high,
         playSound: true,
         enableVibration: true,
         icon: '@mipmap/ic_launcher',
-        color: Color(0xFFCC0000),
+        color: const Color(0xFFCC0000),
+        channelBypassDnd: dndGranted,
       ),
       iOS: DarwinNotificationDetails(
         presentAlert: true,
@@ -508,13 +563,14 @@ Future<void> _showShakeSosWarning(int secondsLeft) async {
   // No notification sound here — the siren is a continuous loop driven
   // separately by an AudioPlayer for the whole countdown (see
   // triggerShakeSos), not a one-shot notification chime.
+  final dndGranted = await _hasDndAccess();
   await _bgFlnp.show(
     id: 9001,
     title: '📳 Shake SOS — Sending in ${secondsLeft}s',
     body: 'Tap CANCEL to stop the SOS from being sent.',
     notificationDetails: NotificationDetails(
       android: AndroidNotificationDetails(
-        _kShakeChannelId,
+        dndGranted ? _kShakeChannelIdDnd : _kShakeChannelId,
         _kShakeChannelName,
         importance: Importance.max,
         priority: Priority.max,
@@ -523,6 +579,7 @@ Future<void> _showShakeSosWarning(int secondsLeft) async {
         vibrationPattern: Int64List.fromList([0, 200]),
         icon: '@mipmap/ic_launcher',
         color: const Color(0xFFCC0000),
+        channelBypassDnd: dndGranted,
         ongoing: true,
         autoCancel: false,
         actions: const [

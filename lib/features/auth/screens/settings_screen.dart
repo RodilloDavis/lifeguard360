@@ -2,7 +2,7 @@
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:permission_handler/permission_handler.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../../core/constants/app_colors.dart';
 import '../../../services/background_service.dart';
@@ -14,6 +14,7 @@ import '../../dashboard/screens/family_settings_screen.dart';
 import '../../notifications/screens/report_history_screen.dart';
 import '../../../services/overlay_service.dart';
 import '../../../services/online_status_service.dart';
+import '../../../main.dart' show refreshFcmChannel;
 import 'set_account_password_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
@@ -32,6 +33,8 @@ class _SettingsScreenState extends State<SettingsScreen>
   bool _loadingCircle = false;
   bool _loadingHistory = false;
   Map<String, dynamic>? _authInfo;
+  final FlutterLocalNotificationsPlugin _flnp =
+      FlutterLocalNotificationsPlugin();
 
   @override
   void initState() {
@@ -39,6 +42,7 @@ class _SettingsScreenState extends State<SettingsScreen>
     WidgetsBinding.instance.addObserver(this);
     _syncBubbleState();
     _loadAuthInfo();
+    _checkDndAccess();
   }
 
   Future<void> _loadAuthInfo() async {
@@ -74,6 +78,7 @@ class _SettingsScreenState extends State<SettingsScreen>
       // was already granted and the app never left the foreground at all.
       if (_bubbleBusy) setState(() => _bubbleBusy = false);
       _syncBubbleState();
+      _recheckDndAccessOnResume();
     }
   }
 
@@ -204,47 +209,78 @@ class _SettingsScreenState extends State<SettingsScreen>
     }
   }
 
-  // ── Do Not Disturb guidance ──────────────────────────────────────────────
+  // ── Do Not Disturb bypass ─────────────────────────────────────────────────
   //
-  // No Android API lets an app switch its own channels to bypass Do Not
-  // Disturb — that toggle only exists in the system notification settings
-  // and only the user can flip it, per channel. Left untouched, every alert
-  // this app sends (SOS, shake SOS, a family member's emergency report, a
-  // dispatcher push) arrives completely silently under DND: no sound, no
-  // heads-up banner, easy to miss entirely on a safety app where that
-  // silence matters. This is the closest an app can get to fixing that
-  // itself — explaining the problem and taking the user straight to where
-  // the fix actually lives.
-  static const List<String> _criticalChannelNames = [
-    'SOS Alerts',
-    'SHAKE SOS',
-    'Emergency Reports',
-    'Report Updates',
-    'Push Alerts',
-  ];
+  // Android has an actual API for this — NotificationChannel.setBypassDnd()
+  // — but it only takes effect for an app that holds "Notification policy
+  // access", a protected permission only the user can grant (there's no
+  // silent/automatic path to it, by design: it's the same permission class
+  // that lets an app read or change the device's Do Not Disturb state).
+  // AppBackgroundService/main.dart create LifeGuard360's alert channels
+  // with bypassDnd: true once this is granted (see their _Dnd channel ids);
+  // requestNotificationPolicyAccess() below is what actually gets there —
+  // one grant, covering every alert channel, instead of a user having to
+  // find and flip a toggle on each one individually in system settings.
+  bool? _dndAccessGranted;
+
+  Future<bool> _checkDndAccess() async {
+    final granted = await _flnp
+            .resolvePlatformSpecificImplementation<
+                AndroidFlutterLocalNotificationsPlugin>()
+            ?.hasNotificationPolicyAccess() ??
+        false;
+    if (mounted) setState(() => _dndAccessGranted = granted);
+    return granted;
+  }
 
   Future<void> _showDndGuidance() async {
     HapticFeedback.selectionClick();
     if (!mounted) return;
+    final alreadyGranted = await _checkDndAccess();
+    if (!mounted) return;
+
+    if (alreadyGranted) {
+      await showDialog(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: const Text('Already granted'),
+          content: const Text(
+            'LifeGuard360 already has Do Not Disturb access — SOS, shake '
+            'SOS, emergency report, and dispatcher alerts will sound and '
+            'show even while your phone is in Do Not Disturb.',
+            style: TextStyle(fontSize: 13.5, height: 1.4),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+
     await showDialog(
       context: context,
       builder: (dialogContext) => AlertDialog(
         shape:
             RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         title: const Text('Let alerts through Do Not Disturb'),
-        content: SingleChildScrollView(
+        content: const SingleChildScrollView(
           child: Text(
             'When your phone\'s Do Not Disturb is on, LifeGuard360\'s '
-            'alerts arrive silently by default — no sound, no banner — '
-            'unless you allow them through.\n\n'
-            'To fix this:\n'
-            '1. Tap "Open App Settings" below, then tap Notifications\n'
-            '2. Open each of these channels: '
-            '${_criticalChannelNames.join(", ")}\n'
-            '3. Turn on "Override Do Not Disturb" (may be worded "Allow '
-            'priority interruptions" or similar on your phone)\n\n'
-            'This only changes LifeGuard360\'s own alerts — Do Not Disturb '
-            'stays exactly as-is for every other app.',
+            'alerts — SOS, shake SOS, a family member\'s emergency report, '
+            'dispatcher messages — arrive completely silently by default: '
+            'no sound, no banner.\n\n'
+            'Granting Do Not Disturb access below fixes this for all of '
+            'them at once, in one tap on the next screen — no need to hunt '
+            'down and flip a setting for each alert type individually.\n\n'
+            'This only changes what LifeGuard360 itself can do — it does '
+            'not turn Do Not Disturb on or off, and every other app is '
+            'completely unaffected.',
             style: TextStyle(fontSize: 13.5, height: 1.4),
           ),
         ),
@@ -260,20 +296,48 @@ class _SettingsScreenState extends State<SettingsScreen>
             ),
             onPressed: () async {
               Navigator.pop(dialogContext);
-              final opened = await openAppSettings();
-              if (!opened && mounted) {
-                _showSnackBar(
-                  'Could not open settings automatically — go to '
-                  'Settings > Apps > LifeGuard360 > Notifications instead.',
-                  color: AppColors.danger,
-                );
-              }
+              await _requestDndAccess();
             },
-            child: const Text('Open App Settings'),
+            child: const Text('Grant Access'),
           ),
         ],
       ),
     );
+  }
+
+  Future<void> _requestDndAccess() async {
+    final androidPlugin = _flnp.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>();
+    try {
+      await androidPlugin?.requestNotificationPolicyAccess();
+    } catch (e) {
+      debugPrint('⚠️ requestNotificationPolicyAccess: $e');
+    }
+    // The system settings screen this opens is a separate Activity, so
+    // there's no result to await — didChangeAppLifecycleState's `resumed`
+    // case (below) is what actually picks up whatever the user decided
+    // once they come back, the same pattern _syncBubbleState already uses
+    // for the overlay permission.
+  }
+
+  // Re-checks Do Not Disturb access and, if it was just granted, has
+  // AppBackgroundService (re)create the alert channels immediately instead
+  // of waiting for the next full app restart — see refreshAlertChannels's
+  // doc comment for why a fresh grant needs a fresh channel id to actually
+  // take effect.
+  Future<void> _recheckDndAccessOnResume() async {
+    final wasGranted = _dndAccessGranted;
+    final granted = await _checkDndAccess();
+    if (granted && wasGranted != true) {
+      await AppBackgroundService.refreshAlertChannels();
+      await refreshFcmChannel();
+      if (mounted) {
+        _showSnackBar(
+          '✅ Do Not Disturb access granted — alerts will now break '
+          'through.',
+        );
+      }
+    }
   }
 
   void _showSnackBar(String message, {Color? color}) {
@@ -369,7 +433,9 @@ class _SettingsScreenState extends State<SettingsScreen>
               _tile(
                 Icons.do_not_disturb_on_outlined,
                 'Do Not Disturb',
-                'Make sure SOS and emergency alerts break through',
+                _dndAccessGranted == true
+                    ? 'Alerts already break through — tap for details'
+                    : 'Make sure SOS and emergency alerts break through',
                 onTap: _showDndGuidance,
               ),
               _divider(),

@@ -625,6 +625,13 @@ final FlutterLocalNotificationsPlugin _localNotif =
 const String _kFcmChannelId = 'lifeguard_fcm_alerts_v2';
 const String _kFcmChannelName = 'LifeGuard360 Push Alerts';
 
+// Separate id used once the user has granted Do Not Disturb access, for the
+// same reason as _kFcmChannelId's own _v2 bump above: bypassDnd is locked in
+// at channel-creation time too, so it needs an id Android has never created
+// before to actually take — see AppBackgroundService's matching _Dnd ids in
+// background_service.dart for the fuller explanation.
+const String _kFcmChannelIdDnd = 'lifeguard_fcm_alerts_v2_dnd';
+
 final InitializationSettings _initSettings = InitializationSettings(
   android: const AndroidInitializationSettings('@mipmap/ic_launcher'),
   iOS: DarwinInitializationSettings(
@@ -676,6 +683,11 @@ Future<void> _showPushNotification({
   required String body,
   String? payload,
 }) async {
+  final androidPlugin = _localNotif.resolvePlatformSpecificImplementation<
+      AndroidFlutterLocalNotificationsPlugin>();
+  final dndGranted =
+      (await androidPlugin?.hasNotificationPolicyAccess()) ?? false;
+
   // Deterministic ID (derived from the notification's own content/payload,
   // not the delivery time) so a redelivered FCM message replaces the
   // existing tray entry instead of stacking a duplicate.
@@ -685,7 +697,7 @@ Future<void> _showPushNotification({
     body: body,
     notificationDetails: NotificationDetails(
       android: AndroidNotificationDetails(
-        _kFcmChannelId,
+        dndGranted ? _kFcmChannelIdDnd : _kFcmChannelId,
         _kFcmChannelName,
         channelDescription: 'Emergency alerts from your family',
         importance: Importance.max,
@@ -699,6 +711,7 @@ Future<void> _showPushNotification({
         icon: '@mipmap/ic_launcher',
         color: const Color(0xFFCC0000),
         visibility: NotificationVisibility.public,
+        channelBypassDnd: dndGranted,
       ),
       iOS: const DarwinNotificationDetails(
         presentAlert: true,
@@ -707,6 +720,34 @@ Future<void> _showPushNotification({
       ),
     ),
     payload: payload,
+  );
+}
+
+/// (Re)creates the FCM push-alert channel, picking the "_dnd" id/bypassDnd
+/// once Do Not Disturb access is granted — see _kFcmChannelIdDnd's doc
+/// comment. Called once at startup, and again from SettingsScreen right
+/// after the user grants access, so this channel doesn't have to wait for
+/// the next full app restart the way it otherwise would (Android locks
+/// bypassDnd at channel-creation time, same as every other alert channel —
+/// see AppBackgroundService.refreshAlertChannels for the fuller version of
+/// this same explanation).
+Future<void> refreshFcmChannel() async {
+  final androidPlugin = _localNotif.resolvePlatformSpecificImplementation<
+      AndroidFlutterLocalNotificationsPlugin>();
+  final dndGranted =
+      (await androidPlugin?.hasNotificationPolicyAccess()) ?? false;
+  await androidPlugin?.createNotificationChannel(
+    AndroidNotificationChannel(
+      dndGranted ? _kFcmChannelIdDnd : _kFcmChannelId,
+      _kFcmChannelName,
+      description: 'Emergency alerts from your family',
+      importance: Importance.max,
+      playSound: true,
+      sound: const RawResourceAndroidNotificationSound('family_alert_siren'),
+      enableVibration: true,
+      showBadge: true,
+      bypassDnd: dndGranted,
+    ),
   );
 }
 
@@ -856,20 +897,7 @@ void main() async {
     },
   );
 
-  final androidPlugin = _localNotif.resolvePlatformSpecificImplementation<
-      AndroidFlutterLocalNotificationsPlugin>();
-  await androidPlugin?.createNotificationChannel(
-    AndroidNotificationChannel(
-      _kFcmChannelId,
-      _kFcmChannelName,
-      description: 'Emergency alerts from your family',
-      importance: Importance.max,
-      playSound: true,
-      sound: const RawResourceAndroidNotificationSound('family_alert_siren'),
-      enableVibration: true,
-      showBadge: true,
-    ),
-  );
+  await refreshFcmChannel();
 
   FirebaseMessaging.onBackgroundMessage(_onBackgroundMessage);
 
