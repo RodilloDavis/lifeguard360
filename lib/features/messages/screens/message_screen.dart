@@ -13,11 +13,13 @@
 
 import 'dart:async';
 import 'dart:convert';
+import 'package:firebase_database/firebase_database.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../../core/constants/app_colors.dart';
+import '../../../core/utils/cached_http_get.dart';
 import '../../dashboard/screens/dashboard_screen.dart';
 import '../../map/screens/map_screen.dart';
 import '../../notifications/screens/notification_screen.dart';
@@ -127,9 +129,21 @@ class _MessageScreenState extends State<MessageScreen> {
 
   Future<void> _fetchChats() async {
     try {
-      final resp = await http
-          .get(Uri.parse('${_kDbUrl}DispatcherChats.json'))
-          .timeout(const Duration(seconds: 10));
+      // Scoped server-side to this user's own chats (orderBy/equalTo on
+      // meta/userId) instead of downloading every user's entire dispatcher
+      // chat list and filtering client-side — that used to transfer every
+      // family's every conversation on every 5s tick regardless of who was
+      // looking. CachedHttpGet also gives this a disk-cache fallback on a
+      // weak connection instead of a bare, uncached request.
+      final resp = await CachedHttpGet.get(
+        Uri.parse('${_kDbUrl}DispatcherChats.json').replace(
+          queryParameters: {
+            'orderBy': '"meta/userId"',
+            'equalTo': '"${widget.userId}"',
+          },
+        ),
+        timeout: const Duration(seconds: 10),
+      );
 
       if (resp.statusCode == 200) {
         final raw = json.decode(resp.body);
@@ -138,10 +152,8 @@ class _MessageScreenState extends State<MessageScreen> {
           for (final entry in (raw).entries) {
             final chatData = entry.value;
             if (chatData is Map && chatData['meta'] is Map) {
-              final meta = chatData['meta'] as Map;
-              if (meta['userId']?.toString() == widget.userId) {
-                chats.add(_ChatMeta.fromMap(meta, entry.key.toString()));
-              }
+              chats.add(
+                  _ChatMeta.fromMap(chatData['meta'] as Map, entry.key.toString()));
             }
           }
           chats.sort((a, b) => b.lastMessageAt.compareTo(a.lastMessageAt));
@@ -542,7 +554,7 @@ class _ChatConvoScreenState extends State<_ChatConvoScreen> {
   List<_ChatMessage> _messages = [];
   bool _loading = true;
   bool _sending = false;
-  Timer? _pollTimer;
+  StreamSubscription<DatabaseEvent>? _messagesSub;
 
   static const List<String> _suggestions = [
     '✅ I can come to the station tomorrow.',
@@ -556,50 +568,49 @@ class _ChatConvoScreenState extends State<_ChatConvoScreen> {
   @override
   void initState() {
     super.initState();
-    _fetchMessages();
     _markRead();
-    _pollTimer =
-        Timer.periodic(const Duration(seconds: 3), (_) => _fetchMessages());
+    // A push-based Firebase listener instead of the previous 3-second poll,
+    // which re-downloaded this chat's ENTIRE message history every 3
+    // seconds for as long as the screen stayed open — the most expensive
+    // poll in the app by a wide margin on any conversation of real length.
+    // The first callback already delivers the current snapshot, so no
+    // separate initial fetch is needed, and every callback after that only
+    // fires when the data actually changed.
+    _messagesSub = FirebaseDatabase.instance
+        .ref('DispatcherChats/${widget.chatId}/messages')
+        .onValue
+        .listen((event) {
+      final raw = event.snapshot.value;
+      if (raw is Map) {
+        final data = Map<String, dynamic>.from(raw);
+        final msgs = data.entries
+            .map((e) => _ChatMessage.fromMap(e.value as Map, e.key))
+            .toList()
+          ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+        if (mounted) {
+          setState(() {
+            _messages = msgs;
+            _loading = false;
+          });
+          _scrollToBottom();
+        }
+      } else if (mounted) {
+        setState(() {
+          _messages = [];
+          _loading = false;
+        });
+      }
+    }, onError: (_) {
+      if (mounted) setState(() => _loading = false);
+    });
   }
 
   @override
   void dispose() {
     _inputCtrl.dispose();
     _scrollCtrl.dispose();
-    _pollTimer?.cancel();
+    _messagesSub?.cancel();
     super.dispose();
-  }
-
-  Future<void> _fetchMessages() async {
-    try {
-      final resp = await http
-          .get(Uri.parse(
-              '${_kDbUrl}DispatcherChats/${widget.chatId}/messages.json'))
-          .timeout(const Duration(seconds: 10));
-
-      if (resp.statusCode == 200) {
-        final raw = json.decode(resp.body);
-        if (raw != null && raw is Map) {
-          final msgs = (raw)
-              .entries
-              .map(
-                  (e) => _ChatMessage.fromMap(e.value as Map, e.key.toString()))
-              .toList()
-            ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
-          if (mounted) {
-            setState(() {
-              _messages = msgs;
-              _loading = false;
-            });
-          }
-          _scrollToBottom();
-        } else {
-          if (mounted) setState(() => _loading = false);
-        }
-      }
-    } catch (_) {
-      if (mounted) setState(() => _loading = false);
-    }
   }
 
   Future<void> _markRead() async {
@@ -653,8 +664,9 @@ class _ChatConvoScreenState extends State<_ChatConvoScreen> {
       _incrementDispUnread();
     } catch (_) {}
 
+    // No manual refetch needed — the messages listener above picks up the
+    // new message as soon as Firebase pushes the change.
     setState(() => _sending = false);
-    _fetchMessages();
   }
 
   Future<void> _incrementDispUnread() async {

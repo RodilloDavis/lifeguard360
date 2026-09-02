@@ -200,6 +200,17 @@ class _FamilyTrackingScreenState extends State<FamilyTrackingScreen>
   }
 
   Future<void> _handleEmergencyHighlight() async {
+    // Guards re-entry here rather than only at each call site: this is
+    // called both from _loadAndTrack() (unconditionally, right after the
+    // first _refresh()) and from _refresh() itself (conditionally, on
+    // every later poll tick) — the first successful call already sets
+    // _hasHighlightedMember below, but _loadAndTrack()'s own call never
+    // checked it, so the initial load fired this twice back-to-back: two
+    // SnackBars, two 800ms-delayed callbacks, and (for a report opened
+    // from Notifications, which always carries an emergencyType) two
+    // "Emergency Alert" dialogs stacked on screen. Checking once here
+    // covers both call sites instead of duplicating the guard at each one.
+    if (_hasHighlightedMember) return;
     // If there's a highlight member ID and we have members loaded
     if (widget.highlightMemberId != null &&
         widget.highlightMemberId!.isNotEmpty &&

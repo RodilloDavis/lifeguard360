@@ -359,6 +359,10 @@ class EmergencyReportService {
             'EmergencyType': type,
             'Status': 'Active',
             'CreatedAt': createdAt,
+            // Needed for UserReportsCacheService's incremental-sync cursor
+            // — see that file for why ReportId's prefix isn't safe to sort
+            // by across report types, unlike this ISO-8601 value.
+            'Timestamp': now.toIso8601String(),
             'Location': location,
             'Barangay': barangay.isNotEmpty ? barangay : 'Unknown Barangay',
             'Priority': 'critical',
@@ -479,6 +483,8 @@ class EmergencyReportService {
             'EmergencyType': type,
             'Status': 'Pending',
             'CreatedAt': createdAt,
+            // See the family-SOS branch above for why this is needed.
+            'Timestamp': now.toIso8601String(),
             'Location': location,
             'Barangay': barangay.isNotEmpty ? barangay : 'Unknown Barangay',
           }),

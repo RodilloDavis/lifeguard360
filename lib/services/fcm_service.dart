@@ -256,6 +256,13 @@ class FcmService {
     }
   }
 
+  // Police (PoliceStation app) only cares about reports it would actually
+  // dispatch on. Shake SOS and the floating SOS bubble are family-alert
+  // mechanisms — they still work exactly as before, they just no longer
+  // push to /DispatcherTokens. Fire/medical/flood/other aren't police
+  // matters either, so they stay out too.
+  static const Set<String> _policeRelevantTypes = {'crime', 'accident'};
+
   // ── NEW: Send push to ALL registered dispatchers ──────────────────────────
   static Future<void> sendNotificationToDispatchers({
     required String reporterName,
@@ -264,6 +271,11 @@ class FcmService {
     required String barangay,
     required String reportId,
   }) async {
+    if (!_policeRelevantTypes.contains(emergencyType)) {
+      print(
+          'ℹ️ sendNotificationToDispatchers: "$emergencyType" is not police-relevant — skipping dispatcher push');
+      return;
+    }
     try {
       final res = await http
           .get(Uri.parse('${_dbUrl}DispatcherTokens.json'))

@@ -1,21 +1,42 @@
 // lib/services/report_history_cache_service.dart
 //
-// Local cache for ReportHistoryScreen. Firebase's /FamilyReports/{reportId}
+// Local cache for ReportHistoryScreen (and, via syncAndGetReports, every
+// other screen that needs a family's report list — the notification badge,
+// My Reports, the notification screen). Firebase's /FamilyReports/{reportId}
 // nodes are only ever appended to or status-patched — nothing is ever
 // removed — so once a report is downloaded and its Status is Resolved, it
-// never needs to be fetched again. This lets repeat visits to Report
-// History (a screen with a genuinely unbounded, ever-growing history) skip
+// never needs to be fetched again. This lets repeat visits skip
 // re-downloading everything: the whole family's report history is fetched
 // once, cached on-device, and afterwards only two small, cheap requests are
-// made — new report IDs since the last sync (server-side key-range filter,
-// not a full re-fetch) and a Status re-check for whatever's still not
-// Resolved. Already-resolved cached reports are never touched again.
+// made — new reports since the last sync and a Status re-check for whatever
+// still isn't Resolved. Already-resolved cached reports are never touched
+// again.
 //
-// Report IDs are generated as "{PREFIX}-{millisecondsSinceEpoch}-{suffix}"
-// (see EmergencyReportService._generateReportId), so lexical key order
-// tracks creation order — which is what makes the server-side "give me
-// every key >= this one" query below work as an incremental cursor.
+// "New since last sync" is found by existence-diffing, not by a cursor.
+// Two cursor designs were tried and both turned out unsafe for this data:
+//   - The lexically-greatest ReportId ("{PREFIX}-{millisecondsSinceEpoch}-
+//     {suffix}") only sorts correctly WITHIN one prefix (BBL-/SHK-/CRM-/
+//     FIR-/...) — across prefixes it compares the letters first, so e.g. a
+//     cursor pinned to the newest "SHK-..." report made every later
+//     "FIR-..." or "BBL-..." report compare as "already synced" and vanish
+//     silently. This is how a family member's fresh report ended up
+//     invisible in Notifications despite being unread.
+//   - Switching the cursor to each report's Timestamp field (ISO-8601,
+//     which DOES sort correctly regardless of type) fixes that, but
+//     Firebase Realtime Database rejects `orderBy` on any field besides
+//     $key/$value unless the project's security rules declare
+//     `".indexOn": "Timestamp"` for this path — which this project's rules
+//     don't. The query came back as an HTTP 400 that this code was
+//     treating as "nothing new", so no report ever synced at all.
+// Firebase's `shallow=true` param needs no such index — it costs one small
+// request for every CURRENT report's key (no bodies), diffed client-side
+// against the ReportIds already cached to find what's actually new. Full
+// bodies are then fetched only for those. Slightly more bytes per poll than
+// a perfect cursor would cost (the shallow key list grows with the family's
+// total history), but nowhere near what a full-body re-fetch costs, immune
+// to any prefix/ordering quirk, and needs no server-side rule changes.
 
+import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -27,8 +48,6 @@ class ReportHistoryCacheService {
 
   static String _reportsKey(String familyCode) =>
       'report_history_cache_$familyCode';
-  static String _cursorKey(String familyCode) =>
-      'report_history_cursor_$familyCode';
 
   /// Reads whatever is cached on-device for [familyCode] with no network
   /// call — lets the screen paint instantly on repeat visits while a sync
@@ -50,29 +69,51 @@ class ReportHistoryCacheService {
   /// check every non-Resolved report regardless of age.
   static const Duration _autoReconcileWindow = Duration(days: 14);
 
+  // Three independent screens/services now poll this on their own ~10-12s
+  // timers (NotificationCountService, My Reports, the notification screen).
+  // Without this guard, overlapping calls would each redo the same shallow
+  // diff + reconcile work concurrently. Keying one shared in-flight Future
+  // per familyCode means every concurrent caller awaits the SAME sync.
+  static final Map<String, Future<List<Map<String, dynamic>>>> _inFlight = {};
+
   /// Brings the cache up to date and returns the full, current report list.
   ///
   /// - No cache yet → one full download (same as the old behaviour), then
   ///   cached for every visit after this.
-  /// - Cache present → only new reports (added since the last sync) are
-  ///   downloaded. Status is re-checked for those new reports plus any
-  ///   cached-but-unresolved report within [_autoReconcileWindow] — unless
-  ///   [forceFullReconcile] is set, in which case every unresolved report
-  ///   is checked regardless of age. Either way, checks that do run are
-  ///   sent in small batches (see EmergencyReportService.reconcileStatuses)
-  ///   so a large history never bursts open a huge number of connections
-  ///   at once — the thing that made this screen feel like it needed a
-  ///   strong connection in the first place.
+  /// - Cache present → only genuinely new reports (existence-diffed via a
+  ///   shallow key fetch — see file header) are downloaded in full. Status
+  ///   is re-checked for those new reports plus any cached-but-unresolved
+  ///   report within [_autoReconcileWindow] — unless [forceFullReconcile]
+  ///   is set, in which case every unresolved report is checked regardless
+  ///   of age. That reconcile pass runs in the BACKGROUND after this
+  ///   returns (see _reconcileInBackground) rather than blocking on it — a
+  ///   family with most of its history still open can make that pass fan
+  ///   out into dozens of individual status checks and take far longer
+  ///   than one poll interval, and new-report visibility must not wait on
+  ///   that.
   static Future<List<Map<String, dynamic>>> syncAndGetReports(
     String familyCode, {
     bool forceFullReconcile = false,
+  }) {
+    if (familyCode.isEmpty) return Future.value(<Map<String, dynamic>>[]);
+    final pending = _inFlight[familyCode];
+    if (pending != null) return pending;
+
+    final future = _syncAndGetReports(familyCode,
+        forceFullReconcile: forceFullReconcile);
+    _inFlight[familyCode] = future;
+    future.whenComplete(() => _inFlight.remove(familyCode));
+    return future;
+  }
+
+  static Future<List<Map<String, dynamic>>> _syncAndGetReports(
+    String familyCode, {
+    bool forceFullReconcile = false,
   }) async {
-    if (familyCode.isEmpty) return [];
     final prefs = await SharedPreferences.getInstance();
     final cached = _readCache(prefs, familyCode);
-    final cursor = prefs.getString(_cursorKey(familyCode));
 
-    if (cached == null || cursor == null) {
+    if (cached == null) {
       // First visit for this family (or a corrupted/cleared cache) — only
       // path that pulls the entire history.
       final all = await EmergencyReportService.getFamilyReports(familyCode,
@@ -87,8 +128,9 @@ class ReportHistoryCacheService {
           r['ReportId'].toString(): r,
     };
 
-    // ── 1. Only reports created since the last sync ───────────────────────
-    final newOnes = await _fetchReportsSince(familyCode, cursor);
+    // ── Only reports Firebase currently has that aren't already cached ────
+    final newOnes = await _fetchNewReports(
+        '${_dbUrl}Families/$familyCode/FamilyReports', byId.keys.toSet());
     final newIds = <String>{};
     for (final r in newOnes) {
       final id = r['ReportId']?.toString() ?? '';
@@ -97,57 +139,116 @@ class ReportHistoryCacheService {
       newIds.add(id);
     }
 
-    // ── 2. Status re-check — every new report, plus recent unresolved ones
-    final cutoff = DateTime.now().subtract(_autoReconcileWindow);
-    final toReconcile = forceFullReconcile
-        ? byId.values.toList()
-        : byId.values.where((r) {
-            final id = r['ReportId']?.toString() ?? '';
-            if (newIds.contains(id)) return true; // always check new reports
-            final created = _parseCreatedAt(r['CreatedAt']?.toString());
-            return created.isAfter(cutoff);
-          }).toList();
+    final quickMerged = byId.values.toList()
+      ..sort((a, b) => _parseCreatedAt(b['CreatedAt']?.toString())
+          .compareTo(_parseCreatedAt(a['CreatedAt']?.toString())));
+    await _writeCache(prefs, familyCode, quickMerged);
 
-    final reconciled =
-        await EmergencyReportService.reconcileStatuses(toReconcile);
-    for (final r in reconciled) {
-      final id = r['ReportId']?.toString() ?? '';
-      if (id.isNotEmpty) byId[id] = r;
+    if (!_reconciling.contains(familyCode)) {
+      _reconciling.add(familyCode);
+      unawaited(_reconcileInBackground(
+              familyCode, byId, newIds, forceFullReconcile)
+          .whenComplete(() => _reconciling.remove(familyCode)));
     }
 
-    final merged = byId.values.toList()
-      ..sort((a, b) =>
-          _parseCreatedAt(b['CreatedAt']?.toString())
-              .compareTo(_parseCreatedAt(a['CreatedAt']?.toString())));
-
-    await _writeCache(prefs, familyCode, merged);
-    return merged;
+    return quickMerged;
   }
 
-  /// Server-side key-range fetch: every /FamilyReports child whose key
-  /// (=ReportId) sorts at or after [cursor]. Firebase's REST `startAt` is
-  /// inclusive, so the cursor's own report — already in the cache — is
-  /// filtered back out below rather than re-merged.
-  static Future<List<Map<String, dynamic>>> _fetchReportsSince(
-      String familyCode, String cursor) async {
-    final uri = Uri.parse('${_dbUrl}Families/$familyCode/FamilyReports.json')
-        .replace(queryParameters: {
-      'orderBy': '"\$key"',
-      'startAt': '"$cursor"',
-    });
+  // Guards the background reconcile pass separately from _inFlight (which
+  // only covers the fast part above): without this, a slow reconcile still
+  // running from one poll would have a fresh one kicked off by every poll
+  // after it — the exact pile-up of overlapping heavy work this whole
+  // change exists to avoid, just moved one step later.
+  static final Set<String> _reconciling = {};
 
-    final resp = await http.get(uri).timeout(const Duration(seconds: 15));
-    if (resp.statusCode != 200) return [];
+  static Future<void> _reconcileInBackground(
+    String familyCode,
+    Map<String, Map<String, dynamic>> byId,
+    Set<String> newIds,
+    bool forceFullReconcile,
+  ) async {
+    try {
+      final cutoff = DateTime.now().subtract(_autoReconcileWindow);
+      final toReconcile = forceFullReconcile
+          ? byId.values.toList()
+          : byId.values.where((r) {
+              final id = r['ReportId']?.toString() ?? '';
+              if (newIds.contains(id)) return true;
+              final created = _parseCreatedAt(r['CreatedAt']?.toString());
+              return created.isAfter(cutoff);
+            }).toList();
 
-    final data = json.decode(resp.body);
-    if (data is! Map) return [];
+      final reconciled =
+          await EmergencyReportService.reconcileStatuses(toReconcile);
+      for (final r in reconciled) {
+        final id = r['ReportId']?.toString() ?? '';
+        if (id.isNotEmpty) byId[id] = r;
+      }
 
-    final out = <Map<String, dynamic>>[];
-    data.forEach((key, value) {
-      if (key == cursor) return; // already cached from the previous sync
-      if (value is Map) out.add(Map<String, dynamic>.from(value));
-    });
-    return out;
+      final merged = byId.values.toList()
+        ..sort((a, b) => _parseCreatedAt(b['CreatedAt']?.toString())
+            .compareTo(_parseCreatedAt(a['CreatedAt']?.toString())));
+
+      final prefs = await SharedPreferences.getInstance();
+      await _writeCache(prefs, familyCode, merged);
+    } catch (_) {
+      // Best-effort — a failed background reconcile just means status
+      // changes are caught on a later attempt instead of this one; the
+      // report list itself was already returned to the caller above.
+    }
+  }
+
+  /// Finds reports that exist under [nodeUrl] (no trailing .json) but
+  /// aren't in [knownIds], and returns their full bodies.
+  ///
+  /// Step 1 is a `shallow=true` GET — Firebase returns just
+  /// `{reportId: true, ...}` for every child with no need to fetch or order
+  /// by anything but $key, so it costs no index and no per-report payload.
+  /// Step 2 fetches full bodies only for the id's Step 1 didn't already
+  /// have cached, in small concurrent batches (same reasoning as
+  /// EmergencyReportService.reconcileStatuses — bounds how many
+  /// connections a family with a lot of genuinely new reports opens at
+  /// once).
+  static Future<List<Map<String, dynamic>>> _fetchNewReports(
+      String nodeUrl, Set<String> knownIds) async {
+    try {
+      final shallowResp = await http
+          .get(Uri.parse('$nodeUrl.json').replace(
+              queryParameters: {'shallow': 'true'}))
+          .timeout(const Duration(seconds: 15));
+      if (shallowResp.statusCode != 200) return [];
+
+      final shallowData = json.decode(shallowResp.body);
+      if (shallowData is! Map) return [];
+
+      final newIds = shallowData.keys
+          .map((k) => k.toString())
+          .where((id) => !knownIds.contains(id))
+          .toList();
+      if (newIds.isEmpty) return [];
+
+      final out = <Map<String, dynamic>>[];
+      const batchSize = 8;
+      for (var i = 0; i < newIds.length; i += batchSize) {
+        final batch = newIds.skip(i).take(batchSize);
+        final results = await Future.wait(batch.map((id) async {
+          try {
+            final resp = await http
+                .get(Uri.parse('$nodeUrl/$id.json'))
+                .timeout(const Duration(seconds: 10));
+            if (resp.statusCode != 200) return null;
+            final data = json.decode(resp.body);
+            return data is Map ? Map<String, dynamic>.from(data) : null;
+          } catch (_) {
+            return null;
+          }
+        }));
+        out.addAll(results.whereType<Map<String, dynamic>>());
+      }
+      return out;
+    } catch (_) {
+      return [];
+    }
   }
 
   static List<Map<String, dynamic>>? _readCache(
@@ -165,22 +266,6 @@ class ReportHistoryCacheService {
   static Future<void> _writeCache(SharedPreferences prefs, String familyCode,
       List<Map<String, dynamic>> reports) async {
     await prefs.setString(_reportsKey(familyCode), json.encode(reports));
-    final cursor = _maxReportId(reports);
-    if (cursor != null) {
-      await prefs.setString(_cursorKey(familyCode), cursor);
-    }
-  }
-
-  /// The lexically greatest ReportId — see file header on why key order
-  /// tracks creation order and doubles as the incremental-sync cursor.
-  static String? _maxReportId(List<Map<String, dynamic>> reports) {
-    String? max;
-    for (final r in reports) {
-      final id = r['ReportId']?.toString() ?? '';
-      if (id.isEmpty) continue;
-      if (max == null || id.compareTo(max) > 0) max = id;
-    }
-    return max;
   }
 
   static DateTime _parseCreatedAt(String? s) =>
@@ -192,6 +277,5 @@ class ReportHistoryCacheService {
   static Future<void> clear(String familyCode) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_reportsKey(familyCode));
-    await prefs.remove(_cursorKey(familyCode));
   }
 }

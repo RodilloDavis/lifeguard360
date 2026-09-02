@@ -28,6 +28,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../core/utils/cached_http_get.dart';
 import 'emergency_report_service.dart';
 import 'firebase_realtime_database.dart';
+import 'report_history_cache_service.dart';
+import 'user_reports_cache_service.dart';
 
 class NotificationCountService {
   static const String _dbUrl =
@@ -149,12 +151,20 @@ class NotificationCountService {
     try {
       final prefs = await SharedPreferences.getInstance();
 
+      // Routed through the incremental caches instead of
+      // EmergencyReportService.getFamilyReports()/getUserReports() directly:
+      // this method is polled every 10s by every screen showing the bell
+      // badge, and those two calls used to re-download BOTH histories in
+      // full — every past resolved report included — on every single tick,
+      // forever. The cache services fetch the full history once and only
+      // the delta (new reports + still-unresolved ones) after that, so
+      // repeat polls cost a small fraction of what they used to regardless
+      // of how long the family's/user's history has grown.
       final results = await Future.wait([
         familyCode.isEmpty
             ? Future.value(<Map<String, dynamic>>[])
-            : EmergencyReportService.getFamilyReports(familyCode,
-                throwOnError: true),
-        EmergencyReportService.getUserReports(userId, throwOnError: true),
+            : ReportHistoryCacheService.syncAndGetReports(familyCode),
+        UserReportsCacheService.syncAndGetReports(userId),
         _pendingWitnessCount(userId, prefs, throwOnError: true),
       ]);
 

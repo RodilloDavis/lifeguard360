@@ -208,13 +208,7 @@ class AppBackgroundService {
 
   static Future<void> start() async {
     if (kIsWeb) return;
-    final svc = FlutterBackgroundService();
-    if (!await svc.isRunning()) {
-      await svc.startService();
-      debugPrint('🚀 Background service started');
-    } else {
-      debugPrint('✅ Background service already running');
-    }
+    await _startGuarded(source: 'start');
   }
 
   static Future<void> stop() async {
@@ -231,10 +225,49 @@ class AppBackgroundService {
 
   static Future<void> ensureRunning() async {
     if (kIsWeb) return;
+    await _startGuarded(source: 'ensureRunning');
+  }
+
+  // Debounces start()/ensureRunning() so a burst of rapid lifecycle
+  // transitions — e.g. the resumed/paused/inactive flicker while the user
+  // is on the system "Display over other apps" permission screen — collapses
+  // into a single startService() call instead of several overlapping ones.
+  //
+  // Each startService() call spins up a brand-new engine (20+ plugins
+  // re-registering, Firebase re-init) that must call setAsForegroundService()
+  // within a short OS-enforced window or Android kills the whole app with
+  // ForegroundServiceDidNotStartInTimeException. Firing that repeatedly in a
+  // few seconds — which every `resumed` event used to do unconditionally —
+  // also trips Android 15+'s foreground-service restart-rate limiter on top
+  // of the per-call timeout, so this needed more than just an isRunning()
+  // check.
+  static bool _startInFlight = false;
+  static DateTime _lastStartAttempt = DateTime(2000);
+
+  static Future<void> _startGuarded({required String source}) async {
+    if (_startInFlight) {
+      debugPrint('⏳ Background service start already in progress ($source)');
+      return;
+    }
+    if (DateTime.now().difference(_lastStartAttempt) <
+        const Duration(seconds: 5)) {
+      debugPrint('⏳ Skipping background service start — too soon ($source)');
+      return;
+    }
+
     final svc = FlutterBackgroundService();
-    if (!await svc.isRunning()) {
-      debugPrint('⚠️ Background service was dead – restarting');
+    if (await svc.isRunning()) {
+      debugPrint('✅ Background service already running ($source)');
+      return;
+    }
+
+    _startInFlight = true;
+    _lastStartAttempt = DateTime.now();
+    try {
       await svc.startService();
+      debugPrint('🚀 Background service started ($source)');
+    } finally {
+      _startInFlight = false;
     }
   }
 }
@@ -522,8 +555,12 @@ Future<void> _dismissShakeSosWarning() async {
 void bgEntryPoint(ServiceInstance service) async {
   WidgetsFlutterBinding.ensureInitialized();
   DartPluginRegistrant.ensureInitialized();
-  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
 
+  // Must happen before any other await: Android kills the whole process
+  // with ForegroundServiceDidNotStartInTimeException if the foreground
+  // notification isn't posted within a few seconds of the service
+  // starting. Firebase.initializeApp() below can take longer than that
+  // budget on a cold start or weak network, so it has to come after.
   if (service is AndroidServiceInstance) {
     await service.setAsForegroundService();
     service.setForegroundNotificationInfo(
@@ -531,6 +568,8 @@ void bgEntryPoint(ServiceInstance service) async {
       content: 'Actively protecting your family • Location tracking ON',
     );
   }
+
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
 
   await _bgFlnp.initialize(
     settings: const InitializationSettings(
@@ -646,9 +685,264 @@ void bgEntryPoint(ServiceInstance service) async {
     setupPresenceIfNeeded(userId);
   }
 
-  await refreshSession();
+  // ── Family/report listeners (replaces REST polling below) ─────────────────
+  //
+  // Tasks 3/4/7/8 used to re-fetch these paths over plain REST on a fixed
+  // timer (every 15-30s, forever, even when nothing changed). Firebase's own
+  // listener API keeps one connection open and only pushes data when
+  // something actually changes, so the same detection happens with a
+  // fraction of the traffic — and faster, since it's push- not poll-based.
+  // Re-bound (idempotently) whenever familyCode/userId resolve or change,
+  // since both can still be empty the first few ticks after service start.
+  String boundFamilyCode = '';
+  String boundUserId = '';
+  StreamSubscription? sosSub;
+  StreamSubscription? latestReportSub;
+  StreamSubscription? shakeReportsSub;
+  StreamSubscription? ownReportAddedSub;
+  StreamSubscription? ownReportChangedSub;
+  final Map<String, bool> notifiedSos = {};
+  final Map<String, bool> notifiedShake = {};
 
-  Timer.periodic(const Duration(seconds: 10), (_) => refreshSession());
+  void bindFamilyDataListeners() {
+    if (familyCode == boundFamilyCode && userId == boundUserId) return;
+    boundFamilyCode = familyCode;
+    boundUserId = userId;
+
+    sosSub?.cancel();
+    latestReportSub?.cancel();
+    shakeReportsSub?.cancel();
+    ownReportAddedSub?.cancel();
+    ownReportChangedSub?.cancel();
+    sosSub = null;
+    latestReportSub = null;
+    shakeReportsSub = null;
+    ownReportAddedSub = null;
+    ownReportChangedSub = null;
+
+    if (familyCode.isEmpty || userId.isEmpty) return;
+
+    // TASK 3 – SOS flag listener (was: poll every 15s)
+    sosSub = FirebaseDatabase.instance
+        .ref('Families/$familyCode/SOS')
+        .onValue
+        .listen((event) async {
+      final raw = event.snapshot.value;
+      if (raw is! Map) return;
+      final sosMap = Map<String, dynamic>.from(raw);
+
+      for (final entry in sosMap.entries) {
+        final triggerId = entry.key;
+        final data = entry.value as Map?;
+        if (data == null) continue;
+
+        final active = data['active'] == true;
+        final sender = data['userName']?.toString() ?? 'A family member';
+
+        if (triggerId == userId) continue;
+
+        if (!active) {
+          notifiedSos.remove(triggerId);
+          continue;
+        }
+        if (notifiedSos[triggerId] == true) continue;
+
+        notifiedSos[triggerId] = true;
+
+        final sosType = data['type']?.toString() ?? '';
+        if (sosType == 'shake') {
+          updateForeground('🚨 SOS from $sender!');
+          continue;
+        }
+
+        await _showSosAlert(sender);
+        updateForeground('🚨 SOS from $sender!');
+      }
+    }, onError: (e) => debugPrint('🚨 BG SOS listener error: $e'));
+
+    // TASK 4 – Latest emergency report listener (was: poll every 20s)
+    latestReportSub = FirebaseDatabase.instance
+        .ref('Families/$familyCode/FamilyReports')
+        .orderByKey()
+        .limitToLast(1)
+        .onChildAdded
+        .listen((event) async {
+      try {
+        final latestId = event.snapshot.key;
+        final latestValue = event.snapshot.value;
+        if (latestId == null || latestValue is! Map) return;
+        if (latestId == lastKnownReportId) return;
+
+        final latestData = Map<String, dynamic>.from(latestValue);
+        final eType = latestData['EmergencyType']?.toString() ?? '';
+        if (eType == 'shake') {
+          lastKnownReportId = latestId;
+          return;
+        }
+
+        if (latestData['UserId']?.toString() == userId) {
+          lastKnownReportId = latestId;
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString('lastKnownReportId', latestId);
+          return;
+        }
+
+        lastKnownReportId = latestId;
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('lastKnownReportId', latestId);
+
+        final reporter = latestData['UserName']?.toString() ?? 'A member';
+        final reportType =
+            latestData['EmergencyType']?.toString() ?? 'emergency';
+        await _showReportAlert(reporter, reportType);
+        updateForeground('📋 New report from $reporter');
+      } catch (e) {
+        debugPrint('📋 BG report listener error: $e');
+      }
+    }, onError: (e) => debugPrint('📋 BG report listener error: $e'));
+
+    // TASK 7 – Shake-report listener (was: poll the whole FamilyReports node
+    // every 20s). Bounded to the most recent 20 reports — a shake alert
+    // worth surfacing live is always recent, and this avoids replaying a
+    // family's entire historical report list on every service (re)start.
+    shakeReportsSub = FirebaseDatabase.instance
+        .ref('Families/$familyCode/FamilyReports')
+        .orderByKey()
+        .limitToLast(20)
+        .onChildAdded
+        .listen((event) async {
+      try {
+        final reportId = event.snapshot.key;
+        final value = event.snapshot.value;
+        if (reportId == null || value is! Map) return;
+        final data = Map<String, dynamic>.from(value);
+        if (data['EmergencyType']?.toString() != 'shake') return;
+        if (data['UserId']?.toString() == userId) return;
+        if (notifiedShake[reportId] == true) return;
+
+        notifiedShake[reportId] = true;
+        final prefs = await SharedPreferences.getInstance();
+        lastKnownShakeId = reportId;
+        await prefs.setString('lastKnownShakeId', reportId);
+
+        final senderName = data['UserName']?.toString() ?? 'A family member';
+        updateForeground('🚨 SHAKE SOS from $senderName!');
+      } catch (e) {
+        debugPrint('🚨 BG shake listener error: $e');
+      }
+    }, onError: (e) => debugPrint('🚨 BG shake listener error: $e'));
+
+    // TASK 8 – Own-report status listener (was: poll the whole
+    // UserEmergencyReports/{userId} node every 30s and diff it against a
+    // saved snapshot). onChildAdded/onChildChanged fire per report instead,
+    // so only the one report that actually moved is ever read or compared.
+    Future<void> handleOwnReportEvent(DataSnapshot snapshot) async {
+      try {
+        final value = snapshot.value;
+        if (value is! Map) return;
+        final report = Map<String, dynamic>.from(value);
+        final status = report['Status']?.toString() ?? '';
+
+        final isAssigned = EmergencyReportService.isAssignedStatus(status);
+        final isResolved = EmergencyReportService.isResolvedStatus(status);
+        if (!isAssigned && !isResolved) return;
+
+        final reportId = report['ReportId']?.toString() ?? snapshot.key ?? '';
+        if (reportId.isEmpty) return;
+        final stage = isResolved ? 'resolved' : 'assigned';
+
+        final prefs = await SharedPreferences.getInstance();
+        final prefsKey = 'notifiedReportStatus_$userId';
+        final storedRaw = prefs.getString(prefsKey);
+        final announced = <String, String>{};
+        final isFirstRun = storedRaw == null;
+        if (storedRaw != null) {
+          try {
+            final m = json.decode(storedRaw);
+            if (m is Map) m.forEach((k, v) => announced['$k'] = '$v');
+          } catch (_) {}
+        }
+
+        // First sighting of this reportId this install: whatever state it's
+        // already in is history, not news — record and move on.
+        if (isFirstRun || announced[reportId] == null) {
+          announced[reportId] = stage;
+          await prefs.setString(prefsKey, json.encode(announced));
+          if (isFirstRun) return;
+        }
+        if (!isFirstRun && announced[reportId] == stage) return;
+
+        announced[reportId] = stage;
+        await prefs.setString(prefsKey, json.encode(announced));
+
+        final type = report['EmergencyType']?.toString() ?? 'other';
+        final label = EmergencyReportService.getTypeLabel(type);
+        final location = _ownReportLocation(report);
+
+        final full = await EmergencyReportService.getReportFromIndex(report) ??
+            const <String, dynamic>{};
+        final merged = <String, dynamic>{...report, ...full};
+
+        if (stage == 'resolved') {
+          await _showReportResolvedAlert(
+            reportId: reportId,
+            reportType: type,
+            reportedAt: report['CreatedAt']?.toString() ?? '',
+            resolvedAt: EmergencyReportService.resolvedAtOf(merged),
+            resolvedBy: EmergencyReportService.resolvedByOf(merged),
+            location: location,
+          );
+          updateForeground('✅ Your $label was resolved');
+        } else {
+          await _showResponderAssignedAlert(
+            reportId: reportId,
+            reportType: type,
+            reportedAt: report['CreatedAt']?.toString() ?? '',
+            assignedAt: EmergencyReportService.assignedAtOf(merged),
+            responderName: EmergencyReportService.responderNameOf(merged),
+            location: location,
+          );
+          updateForeground('🚔 A responder was assigned to your $label');
+        }
+      } catch (e) {
+        debugPrint('📄 BG own-report status listener error: $e');
+      }
+    }
+
+    // Bounded to the most recent 20 reports — same reasoning as
+    // shakeReportsSub above. onChildAdded replays every EXISTING match the
+    // moment a listener attaches (that's how Firebase delivers the initial
+    // snapshot for a live query), and this listener is re-created from
+    // scratch every time bgEntryPoint runs — on every OS-triggered restart
+    // of this foreground service (OEM battery managers kill it often, see
+    // the comment on ignoreBatteryOptimizations above), every phone reboot,
+    // and every fresh login. Left unbounded, a user with a long report
+    // history had their ENTIRE UserEmergencyReports node re-streamed down
+    // this listener on every one of those restarts. A report old enough to
+    // fall outside the last 20 is, in practice, already long resolved —
+    // dispatchers act on reports close to when they're filed, not months
+    // later — so nothing real is lost by no longer watching it live.
+    final ownReportsQuery = FirebaseDatabase.instance
+        .ref('UserEmergencyReports/$userId')
+        .orderByKey()
+        .limitToLast(20);
+    ownReportAddedSub = ownReportsQuery.onChildAdded.listen(
+      (event) => handleOwnReportEvent(event.snapshot),
+      onError: (e) => debugPrint('📄 BG own-report status listener error: $e'),
+    );
+    ownReportChangedSub = ownReportsQuery.onChildChanged.listen(
+      (event) => handleOwnReportEvent(event.snapshot),
+      onError: (e) => debugPrint('📄 BG own-report status listener error: $e'),
+    );
+  }
+
+  await refreshSession();
+  bindFamilyDataListeners();
+
+  Timer.periodic(const Duration(seconds: 10), (_) async {
+    await refreshSession();
+    bindFamilyDataListeners();
+  });
 
   // ============================================================================
   // TASK 1 – GPS → Firebase every 30s
@@ -690,120 +984,22 @@ void bgEntryPoint(ServiceInstance service) async {
       );
     } catch (e) {
       debugPrint('📍 BG location error: $e');
+      // TASK 2 used to be a second, fully independent PATCH firing on its
+      // own parallel 30s timer purely to re-affirm OnlineStatus/LastSeen —
+      // duplicating what the PATCH above already sends on every successful
+      // tick. That doubled this service's steady-state request volume for
+      // no benefit on the common path, so it's folded in here instead:
+      // LastSeen/Online only needs the fallback write on a tick where the
+      // GPS fix itself failed (permission race, timeout, no fix yet).
+      await _patchStatus(userId, 'Online');
     }
   });
 
-  // ============================================================================
-  // TASK 2 – Online-status heartbeat every 30s
-  // ============================================================================
-  //
-  // Belt-and-suspenders alongside the Realtime Database presence system set
-  // up above: this keeps LastSeen fresh and re-affirms Online via the plain
-  // REST path this file already uses everywhere else. Actually detecting a
-  // genuine disconnect (network loss, force-kill, app deletion) is handled
-  // by the onDisconnect() registration in setupPresenceIfNeeded(), not here
-  // — a failed PATCH in this timer is just silently dropped, same as before.
-  Timer.periodic(const Duration(seconds: 30), (_) async {
-    if (userId.isEmpty) return;
-    await _patchStatus(userId, 'Online');
-  });
-
-  // ============================================================================
-  // TASK 3 – SOS flag poll every 15s
-  // ============================================================================
-  final Map<String, bool> notifiedSos = {};
-
-  Timer.periodic(const Duration(seconds: 15), (_) async {
-    if (userId.isEmpty || familyCode.isEmpty) return;
-    try {
-      final res = await http
-          .get(Uri.parse('${_kDbUrl}Families/$familyCode/SOS.json'))
-          .timeout(const Duration(seconds: 10));
-
-      if (res.statusCode != 200) return;
-      final raw = res.body.trim();
-      if (raw == 'null' || raw.isEmpty) return;
-
-      final sosMap = Map<String, dynamic>.from(json.decode(raw) as Map);
-
-      for (final entry in sosMap.entries) {
-        final triggerId = entry.key;
-        final data = entry.value as Map?;
-        if (data == null) continue;
-
-        final active = data['active'] == true;
-        final sender = data['userName']?.toString() ?? 'A family member';
-
-        if (triggerId == userId) continue;
-
-        if (!active) {
-          notifiedSos.remove(triggerId);
-          continue;
-        }
-        if (notifiedSos[triggerId] == true) continue;
-
-        notifiedSos[triggerId] = true;
-
-        final sosType = data['type']?.toString() ?? '';
-        if (sosType == 'shake') {
-          updateForeground('🚨 SOS from $sender!');
-          continue;
-        }
-
-        await _showSosAlert(sender);
-        updateForeground('🚨 SOS from $sender!');
-      }
-    } catch (e) {
-      debugPrint('🚨 BG SOS poll error: $e');
-    }
-  });
-
-  // ============================================================================
-  // TASK 4 – Emergency report poll every 20s
-  // ============================================================================
-  Timer.periodic(const Duration(seconds: 20), (_) async {
-    if (userId.isEmpty || familyCode.isEmpty) return;
-    try {
-      final res = await http
-          .get(Uri.parse(
-              '${_kDbUrl}Families/$familyCode/FamilyReports.json?orderBy="\$key"&limitToLast=1'))
-          .timeout(const Duration(seconds: 10));
-
-      if (res.statusCode != 200) return;
-      final raw = res.body.trim();
-      if (raw == 'null' || raw.isEmpty) return;
-
-      final reportsMap = Map<String, dynamic>.from(json.decode(raw) as Map);
-      final latestId = reportsMap.keys.first;
-      final latestData = reportsMap[latestId] as Map?;
-      if (latestData == null) return;
-      if (latestId == lastKnownReportId) return;
-
-      final eType = latestData['EmergencyType']?.toString() ?? '';
-      if (eType == 'shake') {
-        lastKnownReportId = latestId;
-        return;
-      }
-
-      if (latestData['UserId']?.toString() == userId) {
-        lastKnownReportId = latestId;
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setString('lastKnownReportId', latestId);
-        return;
-      }
-
-      lastKnownReportId = latestId;
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('lastKnownReportId', latestId);
-
-      final reporter = latestData['UserName']?.toString() ?? 'A member';
-      final reportType = latestData['EmergencyType']?.toString() ?? 'emergency';
-      await _showReportAlert(reporter, reportType);
-      updateForeground('📋 New report from $reporter');
-    } catch (e) {
-      debugPrint('📋 BG report poll error: $e');
-    }
-  });
+  // TASK 2 (online-status heartbeat) is now folded into TASK 1's catch
+  // block above instead of running as its own parallel 30s timer — see the
+  // comment there. TASK 3 (SOS flags) and TASK 4 (latest report) are now
+  // handled by bindFamilyDataListeners() above via Firebase listeners
+  // instead of polling — see that function.
 
   // ============================================================================
   // TASK 5 – Watchdog every 60s (prevents Android from killing the service)
@@ -942,172 +1138,9 @@ void bgEntryPoint(ServiceInstance service) async {
     debugPrint('⚠️ Accelerometer error: $e');
   });
 
-  // ============================================================================
-  // TASK 7 – Poll FamilyReports for shake events every 20s
-  // ============================================================================
-  final Map<String, bool> notifiedShake = {};
-
-  Timer.periodic(const Duration(seconds: 20), (_) async {
-    if (userId.isEmpty || familyCode.isEmpty) return;
-    try {
-      final res = await http
-          .get(Uri.parse('${_kDbUrl}Families/$familyCode/FamilyReports.json'))
-          .timeout(const Duration(seconds: 10));
-
-      if (res.statusCode != 200) return;
-      final raw = res.body.trim();
-      if (raw == 'null' || raw.isEmpty) return;
-
-      final allReports = Map<String, dynamic>.from(json.decode(raw) as Map);
-
-      for (final entry in allReports.entries) {
-        final reportId = entry.key;
-        final data = entry.value as Map?;
-        if (data == null) continue;
-        if (data['EmergencyType']?.toString() != 'shake') continue;
-        if (data['UserId']?.toString() == userId) continue;
-        if (notifiedShake[reportId] == true) continue;
-
-        notifiedShake[reportId] = true;
-        final prefs = await SharedPreferences.getInstance();
-        lastKnownShakeId = reportId;
-        await prefs.setString('lastKnownShakeId', reportId);
-
-        final senderName = data['UserName']?.toString() ?? 'A family member';
-        updateForeground('🚨 SHAKE SOS from $senderName!');
-      }
-    } catch (e) {
-      debugPrint('🚨 BG shake poll error: $e');
-    }
-  });
-
-  // ============================================================================
-  // TASK 8 – Own-report status watcher every 30s
-  // ============================================================================
-  //
-  // Watches the user's OWN reports (/UserEmergencyReports/{userId}) for the
-  // two dispatcher-side transitions the reporter cares about:
-  //
-  //   Pending → Acknowledged : a responder has been assigned to the report
-  //   any     → Resolved     : a responder or administrator closed it out
-  //
-  // Without this, either only surfaced if the user happened to reopen My
-  // Reports and notice the badge had changed.
-  //
-  // The last status announced per report is persisted per user, so a service
-  // restart doesn't re-announce, each report can raise both alerts in turn as
-  // it progresses, and switching accounts on one device starts clean.
-  Timer.periodic(const Duration(seconds: 30), (_) async {
-    if (userId.isEmpty) return;
-    try {
-      final res = await http
-          .get(Uri.parse('${_kDbUrl}UserEmergencyReports/$userId.json'))
-          .timeout(const Duration(seconds: 10));
-
-      if (res.statusCode != 200) return;
-      final raw = res.body.trim();
-      if (raw == 'null' || raw.isEmpty) return;
-
-      final decoded = json.decode(raw);
-      if (decoded is! Map) return;
-      final reports = Map<String, dynamic>.from(decoded);
-
-      final prefs = await SharedPreferences.getInstance();
-      final prefsKey = 'notifiedReportStatus_$userId';
-      final storedRaw = prefs.getString(prefsKey);
-      final isFirstRun = storedRaw == null;
-
-      final announced = <String, String>{};
-      if (storedRaw != null) {
-        try {
-          final m = json.decode(storedRaw);
-          if (m is Map) {
-            m.forEach((k, v) => announced['$k'] = '$v');
-          }
-        } catch (_) {}
-      }
-
-      final current = <String, String>{};
-      final pending = <Map<String, dynamic>>[];
-
-      for (final entry in reports.entries) {
-        final data = entry.value;
-        if (data is! Map) continue;
-        final report = Map<String, dynamic>.from(data);
-        final status = report['Status']?.toString() ?? '';
-
-        // Only the two transitions above are announced; Pending and the live
-        // 'Active' SOS state are not news to the person who filed them.
-        final isAssigned = EmergencyReportService.isAssignedStatus(status);
-        final isResolved = EmergencyReportService.isResolvedStatus(status);
-        if (!isAssigned && !isResolved) continue;
-
-        final reportId = report['ReportId']?.toString() ?? entry.key;
-        // Normalised so the dispatcher writing 'acknowledged' one day and
-        // 'Acknowledged' the next doesn't read as a fresh transition.
-        final stage = isResolved ? 'resolved' : 'assigned';
-        current[reportId] = stage;
-        if (!isFirstRun && announced[reportId] != stage) {
-          pending.add(report);
-        }
-      }
-
-      // First run for this user: whatever state reports are already in is
-      // history, not news — record it silently rather than burying the user
-      // in alerts for reports handled weeks ago.
-      if (isFirstRun) {
-        await prefs.setString(prefsKey, json.encode(current));
-        // Superseded by the map above, which tracks both transitions.
-        await prefs.remove('notifiedResolvedReportIds_$userId');
-        debugPrint(
-            '📄 Own-report watcher seeded with ${current.length} report(s)');
-        return;
-      }
-
-      for (final report in pending) {
-        final type = report['EmergencyType']?.toString() ?? 'other';
-        final reportId = report['ReportId']?.toString() ?? '';
-        final label = EmergencyReportService.getTypeLabel(type);
-        final location = _ownReportLocation(report);
-
-        // The responder's name and the assignment time live on the canonical
-        // /{reportLabel}/{reportId} record — the reporter's index entry only
-        // carries Status — so the full record is read for the one report that
-        // just changed, rather than on every poll.
-        final full = await EmergencyReportService.getReportFromIndex(report) ??
-            const <String, dynamic>{};
-        final merged = <String, dynamic>{...report, ...full};
-
-        if (current[reportId] == 'resolved') {
-          await _showReportResolvedAlert(
-            reportId: reportId,
-            reportType: type,
-            reportedAt: report['CreatedAt']?.toString() ?? '',
-            resolvedAt: EmergencyReportService.resolvedAtOf(merged),
-            resolvedBy: EmergencyReportService.resolvedByOf(merged),
-            location: location,
-          );
-          updateForeground('✅ Your $label was resolved');
-          debugPrint('✅ Notified resolution of $reportId ($type)');
-        } else {
-          await _showResponderAssignedAlert(
-            reportId: reportId,
-            reportType: type,
-            reportedAt: report['CreatedAt']?.toString() ?? '',
-            assignedAt: EmergencyReportService.assignedAtOf(merged),
-            responderName: EmergencyReportService.responderNameOf(merged),
-            location: location,
-          );
-          updateForeground('🚔 A responder was assigned to your $label');
-          debugPrint('🚔 Notified responder assignment on $reportId ($type)');
-        }
-      }
-
-      await prefs.setString(prefsKey, json.encode(current));
-    } catch (e) {
-      debugPrint('📄 BG own-report status poll error: $e');
-    }
-  });
+  // TASK 7 (shake reports) and TASK 8 (own-report status) are now handled
+  // by bindFamilyDataListeners() above via Firebase listeners instead of
+  // polling — see that function.
 
   updateForeground('LifeGuard360 is running • Location tracking ON');
   debugPrint('✅ Background service entry point initialised');
@@ -1218,6 +1251,10 @@ Future<Map<String, dynamic>> _saveBgShakeReport(
         'EmergencyType': 'shake',
         'Status': 'Active',
         'CreatedAt': createdAt,
+        // Needed for UserReportsCacheService's incremental-sync cursor —
+        // see that file for why ReportId's prefix isn't safe to sort by
+        // across report types, unlike this ISO-8601 value.
+        'Timestamp': now.toIso8601String(),
         'Location': location,
         'Barangay': barangay.isNotEmpty ? barangay : 'Unknown Barangay',
         'Priority': 'critical',

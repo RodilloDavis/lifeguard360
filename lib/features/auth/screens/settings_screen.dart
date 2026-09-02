@@ -2,6 +2,7 @@
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../../core/constants/app_colors.dart';
 import '../../../services/background_service.dart';
@@ -59,6 +60,19 @@ class _SettingsScreenState extends State<SettingsScreen>
     // target while the app was backgrounded — no overlay event reaches this
     // screen in that window, so re-check once the app is frontmost again.
     if (state == AppLifecycleState.resumed) {
+      // Also recovers the switch from a stuck _bubbleBusy: enabling the
+      // bubble sends the user to the system "Display over other apps"
+      // settings screen and awaits the platform plugin's permission-result
+      // future, which — if that future never resolves (a known failure
+      // mode when the OS recreates the Activity while it's away, dropping
+      // the plugin's pending callback) — left onChanged permanently null,
+      // i.e. a switch that looks broken until the app is killed and
+      // reopened. Resuming is the natural point to recover from that: the
+      // user is back, so reset busy and re-derive the actual on/off state
+      // directly instead of continuing to wait on a future that may never
+      // complete. Harmless no-op on the normal fast path, where permission
+      // was already granted and the app never left the foreground at all.
+      if (_bubbleBusy) setState(() => _bubbleBusy = false);
       _syncBubbleState();
     }
   }
@@ -190,6 +204,78 @@ class _SettingsScreenState extends State<SettingsScreen>
     }
   }
 
+  // ── Do Not Disturb guidance ──────────────────────────────────────────────
+  //
+  // No Android API lets an app switch its own channels to bypass Do Not
+  // Disturb — that toggle only exists in the system notification settings
+  // and only the user can flip it, per channel. Left untouched, every alert
+  // this app sends (SOS, shake SOS, a family member's emergency report, a
+  // dispatcher push) arrives completely silently under DND: no sound, no
+  // heads-up banner, easy to miss entirely on a safety app where that
+  // silence matters. This is the closest an app can get to fixing that
+  // itself — explaining the problem and taking the user straight to where
+  // the fix actually lives.
+  static const List<String> _criticalChannelNames = [
+    'SOS Alerts',
+    'SHAKE SOS',
+    'Emergency Reports',
+    'Report Updates',
+    'Push Alerts',
+  ];
+
+  Future<void> _showDndGuidance() async {
+    HapticFeedback.selectionClick();
+    if (!mounted) return;
+    await showDialog(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        shape:
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text('Let alerts through Do Not Disturb'),
+        content: SingleChildScrollView(
+          child: Text(
+            'When your phone\'s Do Not Disturb is on, LifeGuard360\'s '
+            'alerts arrive silently by default — no sound, no banner — '
+            'unless you allow them through.\n\n'
+            'To fix this:\n'
+            '1. Tap "Open App Settings" below, then tap Notifications\n'
+            '2. Open each of these channels: '
+            '${_criticalChannelNames.join(", ")}\n'
+            '3. Turn on "Override Do Not Disturb" (may be worded "Allow '
+            'priority interruptions" or similar on your phone)\n\n'
+            'This only changes LifeGuard360\'s own alerts — Do Not Disturb '
+            'stays exactly as-is for every other app.',
+            style: TextStyle(fontSize: 13.5, height: 1.4),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Not now'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppColors.secondary,
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () async {
+              Navigator.pop(dialogContext);
+              final opened = await openAppSettings();
+              if (!opened && mounted) {
+                _showSnackBar(
+                  'Could not open settings automatically — go to '
+                  'Settings > Apps > LifeGuard360 > Notifications instead.',
+                  color: AppColors.danger,
+                );
+              }
+            },
+            child: const Text('Open App Settings'),
+          ),
+        ],
+      ),
+    );
+  }
+
   void _showSnackBar(String message, {Color? color}) {
     ScaffoldMessenger.of(context)
       ..clearSnackBars()
@@ -278,6 +364,13 @@ class _SettingsScreenState extends State<SettingsScreen>
                 'Smart Notifications',
                 'Customize your alerts',
                 comingSoon: true,
+              ),
+              _divider(),
+              _tile(
+                Icons.do_not_disturb_on_outlined,
+                'Do Not Disturb',
+                'Make sure SOS and emergency alerts break through',
+                onTap: _showDndGuidance,
               ),
               _divider(),
               _tile(

@@ -12,6 +12,8 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../../core/constants/app_colors.dart';
 import '../../../services/emergency_report_service.dart';
+import '../../../services/report_history_cache_service.dart';
+import '../../../services/user_reports_cache_service.dart';
 import '../../map/screens/family_tracking_screen.dart';
 
 const String _kDbUrl =
@@ -331,7 +333,12 @@ class _NotificationScreenState extends State<NotificationScreen>
   Future<void> _loadMyReportUpdates() async {
     if (widget.userId.isEmpty || _disposed) return;
     try {
-      final reports = await EmergencyReportService.getUserReports(widget.userId);
+      // This poll runs every 10s while this screen is open — routed through
+      // the incremental cache (see UserReportsCacheService) instead of
+      // getUserReports()'s full re-download so repeat ticks only transfer
+      // what changed.
+      final reports =
+          await UserReportsCacheService.syncAndGetReports(widget.userId);
       if (_disposed) return;
       final withMessages = reports
           .where((r) => (r['DispatcherMessage']?.toString() ?? '').isNotEmpty)
@@ -402,34 +409,24 @@ class _NotificationScreenState extends State<NotificationScreen>
     return out;
   }
 
-  // EmergencyReportService.getFamilyReports() swallows network errors and
-  // returns [] on failure (other screens rely on that). We need to tell a
-  // real "zero reports" apart from "fetch failed" so a dropped connection
-  // doesn't overwrite good cached data with an empty list, so this screen
-  // fetches directly instead of going through that service.
+  // Routed through ReportHistoryCacheService instead of a raw full fetch —
+  // this poll runs every 10s while this screen is open, and used to
+  // re-download the family's ENTIRE report history (every past resolved
+  // report included) on every single tick.
+  //
+  // This still satisfies the "zero reports" vs "fetch failed" distinction
+  // _loadReports below relies on to avoid overwriting good cached data with
+  // an empty list on a dropped connection: the cache service throws on a
+  // genuine network failure (no route, timeout) exactly like the old direct
+  // fetch did, on both the very first sync and any sync after. The one
+  // behavior change is a non-200/malformed response once the cache is
+  // already warm — that case now falls back to the last-known-good cached
+  // list instead of throwing, which is strictly safer for this screen (it
+  // was already only trying to protect against exactly that scenario).
   Future<List<Map<String, dynamic>>> _fetchFamilyReports(
       String familyCode) async {
     if (familyCode.isEmpty) return [];
-    final resp = await http
-        .get(Uri.parse('$_kDbUrl/Families/$familyCode/FamilyReports.json'))
-        .timeout(const Duration(seconds: 15));
-    if (resp.statusCode != 200) {
-      throw Exception('FamilyReports fetch failed: ${resp.statusCode}');
-    }
-    final raw = resp.body.trim();
-    if (raw == 'null' || raw.isEmpty) return [];
-    final data = json.decode(raw);
-    if (data is! Map) return [];
-    final list =
-        data.values.map((v) => Map<String, dynamic>.from(v as Map)).toList();
-    list.sort((a, b) => (b['CreatedAt'] ?? '')
-        .toString()
-        .compareTo((a['CreatedAt'] ?? '').toString()));
-    // This bypasses EmergencyReportService.getFamilyReports() for the
-    // reason above, so it has to reconcile against each report's canonical
-    // Status itself — otherwise a family member's report could sit on this
-    // screen showing Pending long after the dispatcher resolved it.
-    return EmergencyReportService.reconcileStatuses(list);
+    return ReportHistoryCacheService.syncAndGetReports(familyCode);
   }
 
   Future<void> _loadReports({bool silent = false}) async {

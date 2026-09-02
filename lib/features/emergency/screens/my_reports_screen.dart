@@ -8,6 +8,8 @@ import '../../../core/constants/app_colors.dart';
 import '../../../core/widgets/animated_refresh_button.dart';
 import '../../../services/emergency_report_service.dart';
 import '../../../services/offline_report_queue_service.dart';
+import '../../../services/report_history_cache_service.dart';
+import '../../../services/user_reports_cache_service.dart';
 
 // Values arrive from the DB as raw slugs ("fire-report", "family-bubble-sos")
 // — turn them into readable text before they reach the UI.
@@ -419,9 +421,15 @@ class _MyReportsScreenState extends State<MyReportsScreen>
       });
     }
     try {
-      final list = _unresolvedFirst(await EmergencyReportService.getUserReports(
-          widget.userId,
-          throwOnError: true));
+      // Routed through UserReportsCacheService instead of
+      // EmergencyReportService.getUserReports() directly — this poll runs
+      // every 12s the whole time this screen is open, and a raw
+      // getUserReports() call re-downloads the user's ENTIRE report
+      // history, resolved reports included, on every single tick. The
+      // cache service does that full download once and only fetches
+      // new/still-unresolved reports after that.
+      final list = _unresolvedFirst(
+          await UserReportsCacheService.syncAndGetReports(widget.userId));
       if (!mounted) return;
       final fp = _reportsFingerprint(list);
       final contentChanged = fp != _myFingerprint;
@@ -461,9 +469,11 @@ class _MyReportsScreenState extends State<MyReportsScreen>
       });
     }
     try {
-      final list = _unresolvedFirst(await EmergencyReportService.getFamilyReports(
-          widget.familyCode,
-          throwOnError: true));
+      // Same reasoning as _loadMyReports above, scoped to the family's
+      // history via ReportHistoryCacheService (already used by Report
+      // History for exactly this reason).
+      final list = _unresolvedFirst(await ReportHistoryCacheService
+          .syncAndGetReports(widget.familyCode));
       if (!mounted) return;
       final fp = _reportsFingerprint(list);
       final contentChanged = fp != _familyFingerprint;
