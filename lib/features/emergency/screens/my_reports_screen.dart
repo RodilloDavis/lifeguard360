@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../../core/constants/app_colors.dart';
 import '../../../core/widgets/animated_refresh_button.dart';
+import '../../../services/connectivity_quality_service.dart';
 import '../../../services/emergency_report_service.dart';
 import '../../../services/offline_report_queue_service.dart';
 import '../../../services/report_history_cache_service.dart';
@@ -308,6 +309,14 @@ class _MyReportsScreenState extends State<MyReportsScreen>
   int _queuedCount = 0;
   StreamSubscription<int>? _queuedCountSub;
 
+  // Device-level connectivity (no network interface at all), shown as a
+  // small icon in the app bar next to the refresh button — distinct from
+  // _isOffline above, which only reflects a failed fetch and covers the
+  // case of a live interface that can't actually reach the server.
+  bool _deviceOffline =
+      ConnectivityQualityService.current == ConnectionQuality.offline;
+  StreamSubscription<ConnectionQuality>? _connectivitySub;
+
   // A report's status can move Pending → In Progress → Resolved on the
   // dispatcher's side at any moment while this screen just sits open — a
   // one-shot load only ever reflects whatever was true when the screen
@@ -336,6 +345,12 @@ class _MyReportsScreenState extends State<MyReportsScreen>
     _queuedCountSub = OfflineReportQueueService.pendingCountStream.listen((count) {
       if (mounted) setState(() => _queuedCount = count);
     });
+    _connectivitySub = ConnectivityQualityService.stream.listen((quality) {
+      final offline = quality == ConnectionQuality.offline;
+      if (offline != _deviceOffline && mounted) {
+        setState(() => _deviceOffline = offline);
+      }
+    });
   }
 
   @override
@@ -343,6 +358,7 @@ class _MyReportsScreenState extends State<MyReportsScreen>
     _tabController.dispose();
     _autoRefreshTimer?.cancel();
     _queuedCountSub?.cancel();
+    _connectivitySub?.cancel();
     super.dispose();
   }
 
@@ -530,6 +546,25 @@ class _MyReportsScreenState extends State<MyReportsScreen>
           onPressed: () => Navigator.pop(context),
         ),
         actions: [
+          if (_deviceOffline)
+            const Padding(
+              padding: EdgeInsets.only(right: 8),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.cloud_off, size: 18, color: AppColors.grey),
+                  SizedBox(width: 4),
+                  Text(
+                    'No internet connection',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: AppColors.grey,
+                    ),
+                  ),
+                ],
+              ),
+            ),
           Padding(
             padding: const EdgeInsets.only(right: 4),
             child: AnimatedRefreshButton(

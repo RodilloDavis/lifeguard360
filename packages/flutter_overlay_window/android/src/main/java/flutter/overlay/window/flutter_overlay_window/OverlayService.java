@@ -67,6 +67,22 @@ public class OverlayService extends Service implements View.OnTouchListener {
 
     private Handler mAnimationHandler = new Handler();
     private float lastX, lastY;
+    // Anchors for the CURRENT drag, captured once at ACTION_DOWN. Every
+    // ACTION_MOVE computes the bubble's position as a pure function of
+    // (currentRawTouch - initialTouch) + initialParams, instead of
+    // accumulating a running total of small per-event deltas. This is
+    // deliberate: accumulating `params.x += dx` against a `lastX` that
+    // resets every event lets any single event's coordinate noise become
+    // permanent, and on long/slow drags (many more events than a quick
+    // flick) that noise compounds into a real, visible drift away from the
+    // finger — observed on-device as the bubble sliding toward the wrong
+    // edge of the screen during a slow, deliberate drag. Recomputing from
+    // these two fixed anchors on every event is self-correcting: no matter
+    // how many events land in between, the bubble's position only ever
+    // depends on where the finger is RIGHT NOW relative to where the drag
+    // started, so there is nothing for per-event error to accumulate onto.
+    private float initialTouchX, initialTouchY;
+    private int initialParamsX, initialParamsY;
     private int lastYPosition;
     private boolean dragging;
     private static final float MAXIMUM_OPACITY_ALLOWED_FOR_S_AND_HIGHER = 0.8f;
@@ -251,6 +267,35 @@ public class OverlayService extends Service implements View.OnTouchListener {
         return mNavigationBarHeight;
     }
 
+    /**
+     * Screen-safe drag bounds: keeps the bubble from overlapping the status
+     * bar at the top or the navigation bar/gesture area at the bottom.
+     * Applied LIVE on every ACTION_MOVE (see onTouch()) — not just at
+     * release — so the bubble simply cannot be dragged past these edges in
+     * the first place, in any direction. This is safe to do without
+     * reintroducing a finger/bubble gap: because the clamp always matches
+     * whatever position the finger's own delta computed once it reaches the
+     * boundary, the bubble still moves 1:1 with the finger right up to the
+     * edge and then just stops exactly there — it never freezes early or
+     * drifts, the way the old clamp (which fought the accumulated-delta
+     * drag math) used to.
+     */
+    private int minDragY() {
+        return statusBarHeightPx() + dpToPx(8);
+    }
+
+    private int maxDragY() {
+        return szWindow.y - flutterView.getHeight() - navigationBarHeightPx() - dpToPx(8);
+    }
+
+    private int minDragX() {
+        return 0;
+    }
+
+    private int maxDragX() {
+        return szWindow.x - flutterView.getWidth();
+    }
+
 
     private void updateOverlayFlag(MethodChannel.Result result, String flag) {
         if (windowManager != null) {
@@ -387,9 +432,29 @@ public class OverlayService extends Service implements View.OnTouchListener {
             WindowManager.LayoutParams params = (WindowManager.LayoutParams) flutterView.getLayoutParams();
             switch (event.getAction()) {
                 case MotionEvent.ACTION_DOWN:
+                    // A new grab must take exclusive control of `params`
+                    // immediately. Without this, grabbing the bubble again
+                    // before the previous release's edge-snap glide (below)
+                    // finishes leaves that Timer's queued frames still
+                    // writing to the same LayoutParams object in parallel
+                    // with this drag — the two fight over params.x/y, which
+                    // shows up as the bubble lagging/jumping away from the
+                    // finger rather than following it 1:1.
+                    if (mTrayAnimationTimer != null) {
+                        mTrayAnimationTimer.cancel();
+                        mTrayAnimationTimer = null;
+                    }
+                    if (mTrayTimerTask != null) {
+                        mTrayTimerTask.cancel();
+                        mTrayTimerTask = null;
+                    }
                     dragging = false;
                     lastX = event.getRawX();
                     lastY = event.getRawY();
+                    initialTouchX = event.getRawX();
+                    initialTouchY = event.getRawY();
+                    initialParamsX = params.x;
+                    initialParamsY = params.y;
                     break;
                 case MotionEvent.ACTION_MOVE:
                     float dx = event.getRawX() - lastX;
@@ -405,19 +470,21 @@ public class OverlayService extends Service implements View.OnTouchListener {
                     boolean invertY = WindowSetup.gravity == (Gravity.BOTTOM | Gravity.LEFT)
                             || WindowSetup.gravity == Gravity.BOTTOM
                             || WindowSetup.gravity == (Gravity.BOTTOM | Gravity.RIGHT);
-                    int xx = params.x + ((int) dx * (invertX ? -1 : 1));
-                    int yy = params.y + ((int) dy * (invertY ? -1 : 1));
+                    // Total displacement since the ORIGINAL touch-down, not
+                    // since the last event — see the field comment above.
+                    float totalDx = event.getRawX() - initialTouchX;
+                    float totalDy = event.getRawY() - initialTouchY;
+                    int xx = initialParamsX + ((int) totalDx * (invertX ? -1 : 1));
+                    int yy = initialParamsY + ((int) totalDy * (invertY ? -1 : 1));
 
-                    // Keep the bubble from being dragged down into the system
-                    // navigation bar's back-button hit area. Without this, a
-                    // bubble parked at the very bottom of the screen can
-                    // intercept — or sit directly on top of — the back
-                    // button, so a tap meant for the bubble ends up
-                    // registering as a back press (or vice versa).
-                    int maxY = szWindow.y - flutterView.getHeight() - navigationBarHeightPx() - dpToPx(8);
-                    if (yy > maxY) {
-                        yy = maxY;
-                    }
+                    // Keep the bubble fully on-screen and clear of the
+                    // status bar / nav bar the whole time it's being
+                    // dragged — see maxDragY()'s doc comment for why this
+                    // is safe to do live without reintroducing a gap.
+                    if (xx < minDragX()) xx = minDragX();
+                    if (xx > maxDragX()) xx = maxDragX();
+                    if (yy < minDragY()) yy = minDragY();
+                    if (yy > maxDragY()) yy = maxDragY();
 
                     params.x = xx;
                     params.y = yy;
@@ -440,10 +507,14 @@ public class OverlayService extends Service implements View.OnTouchListener {
                     }
                     hideCloseTarget();
                     dragging = false;
+
+                    // No clamping needed here — ACTION_MOVE above already
+                    // keeps params.y/x within the screen-safe bounds on
+                    // every single drag event, so the position is already
+                    // valid the moment the finger lifts.
                     lastYPosition = params.y;
                     if (!WindowSetup.positionGravity.equals("none")) {
                         if (windowManager == null) return false;
-                        windowManager.updateViewLayout(flutterView, params);
                         mTrayTimerTask = new TrayAnimationTimerTask();
                         mTrayAnimationTimer = new Timer();
                         mTrayAnimationTimer.schedule(mTrayTimerTask, 0, 25);

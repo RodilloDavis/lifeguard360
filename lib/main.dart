@@ -866,13 +866,33 @@ void _navigateToFamilyTrackingWithReporter({
 Map<String, dynamic>? _pendingNotificationData;
 String? _pendingLocalNotificationPayload;
 
+// Completes once Firebase and the notification plumbing below are ready.
+// SplashRouter awaits this instead of a fixed delay so the branded splash
+// (logo/title/spinner) is the very first thing painted — see the comment
+// on _bootstrap() for why this work no longer runs before runApp().
+final Completer<void> _bootstrapComplete = Completer<void>();
+
 // =============================================================================
 // MAIN
 // =============================================================================
 
-void main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
 
+  // Paint the branded splash screen immediately. It used to sit behind
+  // `await`s for Firebase init, notification-channel setup and cold-start
+  // notification lookups, which left the screen blank (just the native
+  // window background, no logo/spinner) for up to ~2 seconds on this
+  // Transsion/Infinix device before anything appeared — indistinguishable
+  // from a hang. None of that work is needed to draw the splash UI, so it
+  // now runs in _bootstrap() while the splash is already on screen;
+  // SplashRouter awaits _bootstrapComplete before checking the session.
+  runApp(const LifeGuard360App());
+
+  _bootstrap();
+}
+
+Future<void> _bootstrap() async {
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
 
   // Sends uncaught exceptions to the Firebase Crashlytics console instead of
@@ -902,11 +922,10 @@ void main() async {
   FirebaseMessaging.onBackgroundMessage(_onBackgroundMessage);
 
   if (!kIsWeb) {
-    // Handle cold-start notifications. SplashRouter reads the two module
-    // variables below as constructor params in LifeGuard360App.build(),
-    // which runs synchronously as part of runApp() — so this has to
-    // resolve before runApp() is called, or a cold start from tapping a
-    // notification would silently lose its target screen.
+    // Handle cold-start notifications. SplashRouter reads these two module
+    // variables after awaiting _bootstrapComplete, so they need to be
+    // populated before that completer resolves below, or a cold start from
+    // tapping a notification would silently lose its target screen.
     final initialMessage = await FirebaseMessaging.instance.getInitialMessage();
     if (initialMessage != null) {
       _pendingNotificationData = initialMessage.data;
@@ -925,7 +944,7 @@ void main() async {
     }
   }
 
-  runApp(const LifeGuard360App());
+  _bootstrapComplete.complete();
 
   // ── Deferred to AFTER the first frame ──────────────────────────────────
   //
@@ -1045,10 +1064,7 @@ class LifeGuard360App extends StatelessWidget {
       // moment the splash screen hands off, and the floating bubble never
       // shows or hides on any later background/foreground transition.
       builder: (context, child) => _LifecycleWrapper(child: child!),
-      home: SplashRouter(
-        pendingNotificationData: _pendingNotificationData,
-        pendingLocalNotificationPayload: _pendingLocalNotificationPayload,
-      ),
+      home: const SplashRouter(),
     );
   }
 }
@@ -1138,14 +1154,7 @@ class _LifecycleWrapperState extends State<_LifecycleWrapper>
 // =============================================================================
 
 class SplashRouter extends StatefulWidget {
-  final Map<String, dynamic>? pendingNotificationData;
-  final String? pendingLocalNotificationPayload;
-
-  const SplashRouter({
-    super.key,
-    this.pendingNotificationData,
-    this.pendingLocalNotificationPayload,
-  });
+  const SplashRouter({super.key});
 
   @override
   State<SplashRouter> createState() => _SplashRouterState();
@@ -1170,7 +1179,10 @@ class _SplashRouterState extends State<SplashRouter> {
     if (_isProcessing) return;
     _isProcessing = true;
 
-    await Future.delayed(const Duration(seconds: 1));
+    // Waits for Firebase/notification bootstrap instead of a fixed delay,
+    // so the splash shows for exactly as long as startup actually takes —
+    // no shorter (nothing to check session with yet) and no longer.
+    await _bootstrapComplete.future;
     if (!mounted) {
       _isProcessing = false;
       return;
@@ -1200,12 +1212,11 @@ class _SplashRouterState extends State<SplashRouter> {
 
       WidgetsBinding.instance.addPostFrameCallback((_) {
         Future.delayed(const Duration(milliseconds: 500), () {
-          if (widget.pendingNotificationData != null && mounted) {
-            _handleNotificationData(widget.pendingNotificationData!);
-          } else if (widget.pendingLocalNotificationPayload != null &&
-              mounted) {
+          if (_pendingNotificationData != null && mounted) {
+            _handleNotificationData(_pendingNotificationData!);
+          } else if (_pendingLocalNotificationPayload != null && mounted) {
             _handleNotificationData(
-                _decodePayload(widget.pendingLocalNotificationPayload));
+                _decodePayload(_pendingLocalNotificationPayload));
           }
         });
       });
@@ -1231,18 +1242,17 @@ class _SplashRouterState extends State<SplashRouter> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Container(
-              width: 150,
-              height: 150,
-              decoration: const BoxDecoration(
-                color: AppColors.secondary,
-                shape: BoxShape.circle,
-              ),
-              child: const Icon(
-                Icons.security,
-                size: 80,
-                color: Colors.white,
-              ),
+            Image.asset(
+              'assets/icon/app_icon.png',
+              width: 180,
+              height: 180,
+              // The source PNG is 1124x1124 (~900KB) for launcher-icon use.
+              // Decoding it at full resolution just to display it at 180
+              // logical px adds visible delay to the splash's first paint;
+              // capping the decode target to ~2x the display size keeps it
+              // sharp on high-DPI screens while decoding far less data.
+              cacheWidth: 360,
+              cacheHeight: 360,
             ),
             const SizedBox(height: 20),
             const Text(
