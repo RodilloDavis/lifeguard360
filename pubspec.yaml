@@ -1,6 +1,6 @@
 name: lifeguard360
 description: A new Flutter project for emergency response and safety tracking.
-version: 1.0.0+1
+version: 1.0.0+3
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
