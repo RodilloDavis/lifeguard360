@@ -552,14 +552,14 @@ class _MyReportsScreenState extends State<MyReportsScreen>
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(Icons.cloud_off, size: 18, color: AppColors.grey),
+                  Icon(Icons.cloud_off, size: 18, color: AppColors.danger),
                   SizedBox(width: 4),
                   Text(
                     'No internet connection',
                     style: TextStyle(
                       fontSize: 11,
                       fontWeight: FontWeight.w600,
-                      color: AppColors.grey,
+                      color: AppColors.danger,
                     ),
                   ),
                 ],

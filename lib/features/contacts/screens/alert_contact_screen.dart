@@ -35,19 +35,19 @@ class _AlertContactScreenState extends State<AlertContactScreen> {
   final List<Map<String, dynamic>> _contacts = [
     {
       'name': 'Panabo City Police Station',
-      'phone': '0998-598-7052',
+      'phone': '0998-598-7104',
       'isAuthorized': true,
       'type': 'police'
     },
     {
       'name': 'Panabo CDRRMO Rescue/Ambulance',
-      'phone': '0998-598-7052',
+      'phone': '0930-238-5937',
       'isAuthorized': true,
       'type': 'rescue'
     },
     {
       'name': 'Panabo Fire Station',
-      'phone': '0998-598-7053',
+      'phone': '0928-458-7586',
       'isAuthorized': true,
       'type': 'fire'
     },
