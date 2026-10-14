@@ -1951,12 +1951,21 @@ class _DashboardHomeState extends State<DashboardHome>
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text('My Emergency Reports',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                           color: Colors.white,
                           fontSize: 15,
                           fontWeight: FontWeight.bold)),
                   SizedBox(height: 2),
+                  // This card sits in a SliverPersistentHeader with a fixed
+                  // height (_StickyReportsDelegate below) — at a larger
+                  // system font size this subtitle would wrap to a second
+                  // line and overflow that fixed height, so it's clamped to
+                  // one line instead.
                   Text('Track status of your submitted reports',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(color: Colors.white70, fontSize: 12)),
                 ],
               ),

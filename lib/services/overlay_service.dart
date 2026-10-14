@@ -247,6 +247,9 @@ class OverlayService {
   static Future<bool> isEnabled() async {
     try {
       final prefs = await SharedPreferences.getInstance();
+      // NEW: reload so a value written natively (drag-to-X while the app was
+      // backgrounded) isn't hidden behind this isolate's cached copy.
+      await prefs.reload();
       return prefs.getBool(kEnabledKey) ?? false;
     } catch (e) {
       debugPrint('⚠️ OverlayService.isEnabled: $e');

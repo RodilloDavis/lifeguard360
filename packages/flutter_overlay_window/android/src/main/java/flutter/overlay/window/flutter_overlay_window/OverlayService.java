@@ -673,6 +673,20 @@ public class OverlayService extends Service implements View.OnTouchListener {
         // app immediately re-showing the bubble) could still see "running".
         isRunning = false;
 
+        // NEW: persist "bubble off" natively, straight into the file the
+        // shared_preferences plugin reads ("flutter." key prefix). The
+        // messenger event below can be missed while the app is backgrounded
+        // (Dart side suspended), which would leave the Settings toggle stuck
+        // on after the user dragged the bubble into the X.
+        try {
+            getApplicationContext()
+                    .getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+                    .edit()
+                    .putBoolean("flutter.sosBubbleEnabled", false)
+                    .apply();
+        } catch (Exception ignored) {
+        }
+
         if (WindowSetup.messenger != null) {
             Map<String, Object> payload = new HashMap<>();
             payload.put("event", "overlay_dismissed");

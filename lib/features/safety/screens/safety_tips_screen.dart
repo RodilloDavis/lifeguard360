@@ -131,23 +131,41 @@ class _SafetyTipsScreenState extends State<SafetyTipsScreen> {
       ),
       child: Padding(
         padding: const EdgeInsets.all(16),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: [
-            icon,
-            const SizedBox(height: 14),
-            Text(
-              text,
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                fontSize: 12,
-                color: AppColors.secondary,
-                height: 1.45,
-                fontWeight: FontWeight.w500,
-              ),
-            ),
-          ],
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            return Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                icon,
+                const SizedBox(height: 14),
+                // Longer tip text combined with a larger system font size
+                // (accessibility text scaling) or a narrower/shorter device
+                // can need more height than this fixed-aspect-ratio card
+                // has to give — FittedBox uniformly shrinks the wrapped
+                // text block to fit instead of letting it overflow the
+                // card.
+                Flexible(
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    child: SizedBox(
+                      width: constraints.maxWidth,
+                      child: Text(
+                        text,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: AppColors.secondary,
+                          height: 1.45,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            );
+          },
         ),
       ),
     );

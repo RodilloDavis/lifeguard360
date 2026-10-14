@@ -717,7 +717,7 @@ class _NotificationScreenState extends State<NotificationScreen>
                 tooltip: 'Back',
               )
             : null,
-        titleSpacing: 0,
+        titleSpacing: widget.showBackButton ? 0 : 16,
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
